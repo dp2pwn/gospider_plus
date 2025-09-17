@@ -75,7 +75,7 @@ docker run --rm -it \
 ### Windows build
 
 ```
-go build -o gospider++.exe ./
+go build -o gospider.exe ./
 ```
 
 Pack the executable with your favourite installer or distribute alongside a config pack.
