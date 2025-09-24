@@ -71,8 +71,6 @@ func (crawler *Crawler) DeepCrawlWithKatana(cfg CrawlerConfig) error {
 		}
 		options.KnownFiles = "all"
 		options.TechDetect = true
-		options.NoScope = true
-		options.DisplayOutScope = true
 	}
 
 	if cfg.Proxy != "" {

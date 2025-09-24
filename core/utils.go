@@ -168,7 +168,16 @@ func NormalizeDisplayURL(raw string) string {
 	if raw == "" {
 		return raw
 	}
-	return curlyBracketDecoder.Replace(raw)
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return curlyBracketDecoder.Replace(raw)
+	}
+	if parsed.RawQuery != "" {
+		parsed.RawQuery = normalizeQuery(parsed.RawQuery)
+	}
+	parsed.Path = curlyBracketDecoder.Replace(parsed.Path)
+	result := parsed.String()
+	return curlyBracketDecoder.Replace(result)
 }
 
 func DecodeJSString(s string) string {

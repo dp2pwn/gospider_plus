@@ -160,6 +160,7 @@ func normalizeQuery(raw string) string {
 	for _, k := range keys {
 		vals := values[k]
 		sort.Strings(vals)
+		vals = dedupeSortedStrings(vals)
 		escapedKey := url.QueryEscape(k)
 		if len(vals) == 0 {
 			appendQueryComponent(&builder, escapedKey, "")
@@ -182,4 +183,20 @@ func appendQueryComponent(builder *strings.Builder, key, value string) {
 		builder.WriteByte('=')
 		builder.WriteString(value)
 	}
+}
+
+func dedupeSortedStrings(values []string) []string {
+	if len(values) < 2 {
+		return values
+	}
+	deduped := make([]string, 0, len(values))
+	var last string
+	for i, v := range values {
+		if i > 0 && v == last {
+			continue
+		}
+		deduped = append(deduped, v)
+		last = v
+	}
+	return deduped
 }
