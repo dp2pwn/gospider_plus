@@ -46,6 +46,7 @@ type Crawler struct {
 	reflectedStore   map[string]*reflectionEntry
 	reflectedMutex   sync.Mutex
 	reflectedWriter  *Output
+	registry         *URLRegistry
 	backoffMutex     sync.Mutex
 	backoff429       int
 	backoff403       int
@@ -63,6 +64,25 @@ type SpiderOutput struct {
 	Length     int    `json:"length"`
 	Param      string `json:"param,omitempty"`
 	Payload    string `json:"payload,omitempty"`
+}
+
+func (crawler *Crawler) isDuplicateURL(raw string) bool {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return true
+	}
+
+	if crawler.registry != nil {
+		if crawler.registry.Duplicate(value) {
+			return true
+		}
+	}
+
+	if crawler.urlSet == nil {
+		crawler.urlSet = stringset.NewStringFilter()
+	}
+
+	return crawler.urlSet.Duplicate(value)
 }
 
 func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
@@ -285,6 +305,7 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 		domain:              domain,
 		Output:              output,
 		reflectedWriter:     reflectedOutput,
+		registry:            cfg.Registry,
 		urlSet:              stringset.NewStringFilter(),
 		subSet:              stringset.NewStringFilter(),
 		jsSet:               stringset.NewStringFilter(),
@@ -397,7 +418,7 @@ func (crawler *Crawler) Start(linkfinder bool) {
 				return
 			}
 		}
-		if !crawler.urlSet.Duplicate(urlString) {
+		if !crawler.isDuplicateURL(urlString) {
 			outputFormat := fmt.Sprintf("[href] - %s", urlString)
 			if crawler.JsonOutput {
 				sout := SpiderOutput{
@@ -792,7 +813,7 @@ func (crawler *Crawler) setupLinkFinder() {
 					fileExt := GetExtType(rebuildURL)
 					if fileExt == ".js" || fileExt == ".xml" || fileExt == ".json" || fileExt == ".map" {
 						crawler.feedLinkfinder(rebuildURL, "linkfinder", "javascript")
-					} else if !crawler.urlSet.Duplicate(rebuildURL) {
+					} else if !crawler.isDuplicateURL(rebuildURL) {
 
 						if crawler.JsonOutput {
 							sout := SpiderOutput{
@@ -824,7 +845,7 @@ func (crawler *Crawler) setupLinkFinder() {
 						if fileExt == ".js" || fileExt == ".xml" || fileExt == ".json" || fileExt == ".map" {
 							crawler.feedLinkfinder(urlWithJSHostIn, "linkfinder", "javascript")
 						} else {
-							if crawler.urlSet.Duplicate(urlWithJSHostIn) {
+							if crawler.isDuplicateURL(urlWithJSHostIn) {
 								continue
 							} else {
 

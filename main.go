@@ -171,6 +171,13 @@ func run(cmd *cobra.Command, _ []string) {
 				siteWg.Add(1)
 				go func() {
 					defer siteWg.Done()
+					if err := crawler.DeepCrawlWithKatana(crawlerConfig); err != nil {
+						core.Logger.Errorf("katana crawl failed for %s: %v", site, err)
+					}
+				}()
+				siteWg.Add(1)
+				go func() {
+					defer siteWg.Done()
 					crawler.Start(linkfinder)
 				}()
 
@@ -179,7 +186,6 @@ func run(cmd *cobra.Command, _ []string) {
 					siteWg.Add(1)
 					go core.ParseSiteMap(site, crawler, crawler.C, &siteWg)
 				}
-
 				// Find Robots.txt
 				if robots {
 					siteWg.Add(1)

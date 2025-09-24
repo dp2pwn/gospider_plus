@@ -9,6 +9,7 @@ import (
 
 // CrawlerConfig captures CLI options that influence crawler behavior.
 type CrawlerConfig struct {
+	Registry        *URLRegistry
 	Quiet           bool
 	JSONOutput      bool
 	MaxDepth        int
