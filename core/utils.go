@@ -16,6 +16,8 @@ import (
 	"golang.org/x/net/publicsuffix"
 )
 
+var curlyBracketDecoder = strings.NewReplacer("%7B", "{", "%7b", "{", "%7D", "}", "%7d", "}")
+
 var (
 	nameStripRE = regexp.MustCompile("(?i)^((20)|(25)|(2b)|(2f)|(3d)|(3a)|(40))+")
 )
@@ -160,6 +162,13 @@ func DecodeChars(s string) string {
 	)
 	s = replacer.Replace(s)
 	return s
+}
+
+func NormalizeDisplayURL(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	return curlyBracketDecoder.Replace(raw)
 }
 
 func DecodeJSString(s string) string {

@@ -7,9 +7,17 @@ import (
 	"github.com/spf13/cobra"
 )
 
+type ExtractorIntensity string
+
+const (
+	IntensityStandard ExtractorIntensity = "standard"
+	IntensityUltra    ExtractorIntensity = "ultra"
+)
+
 // CrawlerConfig captures CLI options that influence crawler behavior.
 type CrawlerConfig struct {
 	Registry        *URLRegistry
+	Intensity       ExtractorIntensity
 	Quiet           bool
 	JSONOutput      bool
 	MaxDepth        int
@@ -52,23 +60,26 @@ func NewCrawlerConfig(cmd *cobra.Command) CrawlerConfig {
 	}
 
 	cfg := CrawlerConfig{
-		Quiet:           getBool("quiet"),
-		JSONOutput:      getBool("json"),
-		MaxDepth:        getInt("depth"),
-		MaxConcurrency:  getInt("concurrent"),
-		Delay:           time.Duration(getInt("delay")) * time.Second,
-		RandomDelay:     time.Duration(getInt("random-delay")) * time.Second,
-		Length:          getBool("length"),
-		Raw:             getBool("raw"),
-		Subs:            getBool("subs"),
-		Reflected:       getBool("reflected"),
-		Stealth:         getBool("stealth"),
-		Proxy:           getString("proxy"),
-		Timeout:         time.Duration(getInt("timeout")) * time.Second,
-		NoRedirect:      getBool("no-redirect"),
-		BurpFile:        getString("burp"),
-		Cookie:          getString("cookie"),
-		Headers:         func() []string { v, _ := cmd.Flags().GetStringArray("header"); return v }(),
+		Quiet:          getBool("quiet"),
+		JSONOutput:     getBool("json"),
+		MaxDepth:       getInt("depth"),
+		MaxConcurrency: getInt("concurrent"),
+		Delay:          time.Duration(getInt("delay")) * time.Second,
+		RandomDelay:    time.Duration(getInt("random-delay")) * time.Second,
+		Length:         getBool("length"),
+		Raw:            getBool("raw"),
+		Subs:           getBool("subs"),
+		Reflected:      getBool("reflected"),
+		Stealth:        getBool("stealth"),
+		Proxy:          getString("proxy"),
+		Timeout:        time.Duration(getInt("timeout")) * time.Second,
+		NoRedirect:     getBool("no-redirect"),
+		BurpFile:       getString("burp"),
+		Cookie:         getString("cookie"),
+		Headers: func() []string {
+			v, _ := cmd.Flags().GetStringArray("header")
+			return v
+		}(),
 		UserAgent:       strings.ToLower(getString("user-agent")),
 		OutputDir:       getString("output"),
 		ReflectedOutput: getString("reflected-output"),
@@ -76,6 +87,7 @@ func NewCrawlerConfig(cmd *cobra.Command) CrawlerConfig {
 		Blacklist:       getString("blacklist"),
 		Whitelist:       getString("whitelist"),
 		WhitelistDomain: getString("whitelist-domain"),
+		Intensity:       IntensityUltra,
 	}
 
 	if cfg.ReflectedOutput != "" {

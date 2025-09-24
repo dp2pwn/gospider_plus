@@ -67,22 +67,30 @@ type SpiderOutput struct {
 }
 
 func (crawler *Crawler) isDuplicateURL(raw string) bool {
-	value := strings.TrimSpace(raw)
-	if value == "" {
-		return true
-	}
+	return crawler.isDuplicateRequest(http.MethodGet, raw, "")
+}
 
+func (crawler *Crawler) isDuplicateRequest(method, raw, body string) bool {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	if method == "" {
+		method = http.MethodGet
+	}
 	if crawler.registry != nil {
-		if crawler.registry.Duplicate(value) {
+		if crawler.registry.DuplicateRequest(method, raw, body) {
 			return true
 		}
 	}
-
-	if crawler.urlSet == nil {
-		crawler.urlSet = stringset.NewStringFilter()
+	if method == http.MethodGet {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			return true
+		}
+		if crawler.urlSet == nil {
+			crawler.urlSet = stringset.NewStringFilter()
+		}
+		return crawler.urlSet.Duplicate(value)
 	}
-
-	return crawler.urlSet.Duplicate(value)
+	return false
 }
 
 func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
@@ -92,6 +100,10 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 		os.Exit(1)
 	}
 	Logger.Infof("Start crawling: %s", site)
+	registry := cfg.Registry
+	if registry == nil {
+		registry = NewURLRegistry()
+	}
 
 	quiet := cfg.Quiet
 	jsonOutput := cfg.JSONOutput
@@ -305,7 +317,7 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 		domain:              domain,
 		Output:              output,
 		reflectedWriter:     reflectedOutput,
-		registry:            cfg.Registry,
+		registry:            registry,
 		urlSet:              stringset.NewStringFilter(),
 		subSet:              stringset.NewStringFilter(),
 		jsSet:               stringset.NewStringFilter(),
@@ -523,13 +535,20 @@ func (crawler *Crawler) Start(linkfinder bool) {
 		if crawler.reflected {
 			crawler.handleBaselineReflection(response)
 		}
+		duplicateContent := false
+		if crawler.registry != nil && response.Request != nil && response.Request.URL != nil {
+			duplicateContent = crawler.registry.MarkResponse(response.Request.Method, response.Request.URL.String(), response.Body)
+		}
 		crawler.recordBackoff(response.StatusCode)
 		respStr := DecodeChars(string(response.Body))
 
 		if len(crawler.filterLength_slice) == 0 || !contains(crawler.filterLength_slice, len(respStr)) {
+			if duplicateContent {
+				return
+			}
 
 			// Verify which link is working
-			u := response.Request.URL.String()
+			u := NormalizeDisplayURL(response.Request.URL.String())
 			outputFormat := fmt.Sprintf("[url] - [code-%d] - %s", response.StatusCode, u)
 
 			if crawler.length {
@@ -586,7 +605,7 @@ func (crawler *Crawler) Start(linkfinder bool) {
 			return
 		}
 
-		u := response.Request.URL.String()
+		u := NormalizeDisplayURL(response.Request.URL.String())
 		outputFormat := fmt.Sprintf("[url] - [code-%d] - %s", response.StatusCode, u)
 
 		if crawler.JsonOutput {
@@ -613,14 +632,69 @@ func (crawler *Crawler) Start(linkfinder bool) {
 		}
 	})
 
+	if crawler.subs {
+		crawler.bootstrapSubdomains()
+	}
 	err := crawler.C.Visit(crawler.site.String())
 	if err != nil {
 		Logger.Errorf("Failed to start %s: %s", crawler.site.String(), err)
 	}
 }
 
+func (crawler *Crawler) bootstrapSubdomains() {
+	seeds := FetchSubdomains(crawler.domain)
+	if len(seeds) == 0 {
+		return
+	}
+	for _, sub := range seeds {
+		if sub == "" {
+			continue
+		}
+		if crawler.subSet != nil && crawler.subSet.Duplicate(sub) {
+			continue
+		}
+		if crawler.subSet == nil {
+			crawler.subSet = stringset.NewStringFilter()
+		}
+		_ = crawler.subSet.Duplicate(sub)
+
+		logLine := "[subdomains] - " + sub
+		if crawler.JsonOutput {
+			sout := SpiderOutput{
+				Input:      crawler.Input,
+				Source:     "crt.sh",
+				OutputType: "subdomain",
+				Output:     sub,
+			}
+			if data, err := jsoniter.MarshalToString(sout); err == nil {
+				logLine = data
+			}
+		} else if crawler.Quiet {
+			logLine = sub
+		}
+
+		if !crawler.Quiet || crawler.JsonOutput {
+			fmt.Println(logLine)
+		}
+		if crawler.Output != nil {
+			crawler.Output.WriteToFile(logLine)
+		}
+
+		for _, scheme := range []string{"https", "http"} {
+			seedURL := fmt.Sprintf("%s://%s", scheme, sub)
+			if crawler.isDuplicateURL(seedURL) {
+				continue
+			}
+			_ = crawler.C.Visit(seedURL)
+		}
+	}
+}
+
 // Find subdomains from response
 func (crawler *Crawler) findSubdomains(resp string) {
+	if !crawler.subs {
+		return
+	}
 	subs := GetSubdomains(resp, crawler.domain)
 	for _, sub := range subs {
 		if !crawler.subSet.Duplicate(sub) {
@@ -735,7 +809,7 @@ func (crawler *Crawler) setupLinkFinder() {
 		if len(crawler.filterLength_slice) == 0 || !contains(crawler.filterLength_slice, len(respStr)) {
 
 			// Verify which link is working
-			u := response.Request.URL.String()
+			u := NormalizeDisplayURL(response.Request.URL.String())
 			outputFormat := fmt.Sprintf("[url] - [code-%d] - %s", response.StatusCode, u)
 
 			if crawler.length {

@@ -140,6 +140,9 @@ func (crawler *Crawler) queueRequest(req JSRequest, origin string, reflected boo
 	if method == "" {
 		method = http.MethodGet
 	}
+	if crawler.isDuplicateRequest(method, req.RawURL, req.Body) {
+		return
+	}
 
 	headers := http.Header{}
 	for k, v := range req.Headers {

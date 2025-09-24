@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
@@ -22,8 +23,13 @@ func (crawler *Crawler) DeepCrawlWithKatana(cfg CrawlerConfig) error {
 	}
 
 	options := types.DefaultOptions
+	intensity := cfg.Intensity
+	if intensity == "" {
+		intensity = IntensityUltra
+	}
+
 	options.URLs = goflags.StringSlice{crawler.Input}
-	options.MaxDepth = resolveKatanaDepth(cfg.MaxDepth)
+	options.MaxDepth = resolveKatanaDepth(cfg.MaxDepth, cfg.Intensity)
 	if cfg.MaxConcurrency > 0 {
 		options.Concurrency = cfg.MaxConcurrency
 		options.Parallelism = cfg.MaxConcurrency
@@ -36,6 +42,37 @@ func (crawler *Crawler) DeepCrawlWithKatana(cfg CrawlerConfig) error {
 	}
 	if options.Timeout <= 0 {
 		options.Timeout = types.DefaultOptions.Timeout
+	}
+	if intensity == IntensityUltra {
+		multiplier := 10
+		baseConc := options.Concurrency
+		if baseConc <= 0 {
+			if cfg.MaxConcurrency > 0 {
+				baseConc = cfg.MaxConcurrency
+			} else {
+				baseConc = 10
+			}
+		}
+		options.Concurrency = baseConc * multiplier
+		options.Parallelism = baseConc * multiplier
+		if options.RateLimit <= 0 {
+			options.RateLimit = 150
+		}
+		options.RateLimit *= multiplier
+		if options.RateLimitMinute > 0 {
+			options.RateLimitMinute *= multiplier
+		} else {
+			options.RateLimitMinute = options.RateLimit * multiplier
+		}
+		if options.CrawlDuration == 0 {
+			options.CrawlDuration = 30 * time.Minute
+		} else {
+			options.CrawlDuration *= time.Duration(multiplier)
+		}
+		options.KnownFiles = "all"
+		options.TechDetect = true
+		options.NoScope = true
+		options.DisplayOutScope = true
 	}
 
 	if cfg.Proxy != "" {
@@ -106,9 +143,18 @@ func (crawler *Crawler) DeepCrawlWithKatana(cfg CrawlerConfig) error {
 	return katanaCrawler.Crawl(crawler.Input)
 }
 
-func resolveKatanaDepth(depth int) int {
+func resolveKatanaDepth(depth int, intensity ExtractorIntensity) int {
 	if depth <= 0 {
-		return 25
+		depth = 25
+	}
+	if intensity == IntensityUltra {
+		if depth < 25 {
+			depth = 25
+		}
+		depth *= 10
+		if depth < 100 {
+			depth = 100
+		}
 	}
 	return depth
 }
@@ -169,7 +215,7 @@ func (f *filterAdapter) UniqueURL(u string) bool {
 	if f.inner != nil && !f.inner.UniqueURL(u) {
 		return false
 	}
-	if f.registry != nil && f.registry.Duplicate(u) {
+	if f.registry != nil && f.registry.DuplicateRequest(http.MethodGet, u, "") {
 		return false
 	}
 	return true
@@ -190,15 +236,28 @@ func (f *filterAdapter) IsCycle(u string) bool {
 }
 
 func (crawler *Crawler) handleKatanaResult(res katanaOutput.Result) {
-	if res.Request == nil || res.Request.URL == "" {
+	method := ""
+	body := ""
+	target := ""
+	if res.Request != nil {
+		method = res.Request.Method
+		body = res.Request.Body
+		target = res.Request.URL
+	}
+	if target == "" && res.Response != nil && res.Response.Resp != nil && res.Response.Resp.Request != nil && res.Response.Resp.Request.URL != nil {
+		target = res.Response.Resp.Request.URL.String()
+	}
+	if target == "" {
 		return
 	}
-
-	target := res.Request.URL
-	if crawler.isDuplicateURL(target) {
+	target = NormalizeDisplayURL(target)
+	if crawler.isDuplicateRequest(method, target, body) {
 		return
 	}
-
+	method = strings.ToUpper(strings.TrimSpace(method))
+	if method == "" {
+		method = http.MethodGet
+	}
 	status := 0
 	length := 0
 	if res.Response != nil {
@@ -209,34 +268,41 @@ func (crawler *Crawler) handleKatanaResult(res katanaOutput.Result) {
 			length = len(res.Response.Body)
 		}
 	}
-
-	line := crawler.renderKatanaLine(res, target, status, length)
+	if method == http.MethodPost && status > 0 {
+		Logger.Infof("[post-hit] %s %s (%d)", method, target, status)
+	}
+	line := crawler.renderKatanaLine(res, target, method, status, length)
 	if line == "" {
 		return
 	}
-
 	if !crawler.Quiet || crawler.JsonOutput {
 		fmt.Println(line)
 	} else if crawler.Quiet {
 		fmt.Println(line)
 	}
-
 	if crawler.Output != nil {
 		crawler.Output.WriteToFile(line)
 	}
 }
 
-func (crawler *Crawler) renderKatanaLine(res katanaOutput.Result, target string, status, length int) string {
+func (crawler *Crawler) renderKatanaLine(res katanaOutput.Result, target, method string, status, length int) string {
 	source := "katana"
 	if res.Request != nil && res.Request.Source != "" {
 		source = res.Request.Source
 	}
-
+	methodTag := strings.ToUpper(strings.TrimSpace(method))
+	if methodTag == "" {
+		methodTag = http.MethodGet
+	}
+	outputType := "katana"
+	if methodTag != http.MethodGet {
+		outputType = "katana-" + strings.ToLower(methodTag)
+	}
 	if crawler.JsonOutput {
 		sout := SpiderOutput{
 			Input:      crawler.Input,
 			Source:     source,
-			OutputType: "katana",
+			OutputType: outputType,
 			Output:     target,
 			StatusCode: status,
 			Length:     length,
@@ -245,13 +311,17 @@ func (crawler *Crawler) renderKatanaLine(res katanaOutput.Result, target string,
 			return data
 		}
 	}
-
 	if crawler.Quiet {
+		if methodTag != http.MethodGet {
+			return fmt.Sprintf("%s %s", methodTag, target)
+		}
 		return target
 	}
-
 	builder := strings.Builder{}
 	builder.WriteString("[katana]")
+	if methodTag != http.MethodGet {
+		builder.WriteString("[" + methodTag + "]")
+	}
 	if status > 0 {
 		builder.WriteString(fmt.Sprintf("[%d]", status))
 	}
