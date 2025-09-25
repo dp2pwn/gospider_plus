@@ -33,6 +33,7 @@ func New(initial ...string) Set {
 
 // Has returns true if the receiver Set already contains the element string argument.
 func (s Set) Has(element string) bool {
+	element = strings.ToLower(element)
 	_, exists := s[element]
 	return exists
 }
