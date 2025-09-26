@@ -17,6 +17,52 @@ type FormField struct {
 	Value string
 }
 
+var formValueHints = map[string]string{
+	"email":     "gospider@example.com",
+	"username":  "gospider",
+	"user":      "gospider",
+	"name":      "gospider",
+	"firstname": "gospider",
+	"lastname":  "tester",
+	"search":    "gospider",
+	"query":     "gospider",
+	"q":         "gospider",
+	"token":     "gospider_token",
+	"id":        "1",
+	"phone":     "5551234567",
+	"zip":       "12345",
+	"address":   "1 Spider Street",
+}
+
+func defaultFormValue(name, inputType, current string) string {
+	if current != "" {
+		return current
+	}
+	key := strings.ToLower(name)
+	if hint, ok := formValueHints[key]; ok {
+		return hint
+	}
+	switch strings.ToLower(inputType) {
+	case "email":
+		return "gospider@example.com"
+	case "password":
+		return "G0sp!der"
+	case "search":
+		return "gospider"
+	case "url":
+		return "https://example.com"
+	case "number":
+		return "1"
+	}
+	if strings.Contains(key, "mail") {
+		return "gospider@example.com"
+	}
+	if strings.Contains(key, "name") {
+		return "gospider"
+	}
+	return "gospider"
+}
+
 // buildFormRequest constructs a JSRequest from form attributes and fields.
 func buildFormRequest(action, method string, fields []FormField, base *url.URL) (JSRequest, bool) {
 	resolved := strings.TrimSpace(action)
@@ -121,6 +167,12 @@ func ExtractFormRequests(sel *goquery.Selection, base *url.URL) []JSRequest {
 		requests = append(requests, emptyReq)
 	}
 
+	for i := range requests {
+		if len(requests[i].Events) == 0 {
+			requests[i].Events = []string{"input", "change", "paste"}
+		}
+	}
+
 	return requests
 }
 
@@ -145,12 +197,19 @@ func extractFormFields(sel *goquery.Selection) []FormField {
 		case "submit", "button", "image", "reset", "file":
 			return
 		}
+		if inputType != "checkbox" && inputType != "radio" {
+			value = defaultFormValue(name, inputType, value)
+		} else if value == "" {
+			value = defaultFormValue(name, inputType, value)
+		}
 		fields = append(fields, FormField{Name: name, Value: value})
 	})
 
 	sel.Find("textarea").Each(func(_ int, s *goquery.Selection) {
 		if name, exists := s.Attr("name"); exists {
-			fields = append(fields, FormField{Name: name, Value: strings.TrimSpace(s.Text())})
+			value := strings.TrimSpace(s.Text())
+			value = defaultFormValue(name, "textarea", value)
+			fields = append(fields, FormField{Name: name, Value: value})
 		}
 	})
 
@@ -170,6 +229,7 @@ func extractFormFields(sel *goquery.Selection) []FormField {
 			}
 			return true
 		})
+		value = defaultFormValue(name, "select", value)
 		fields = append(fields, FormField{Name: name, Value: value})
 	})
 

@@ -64,6 +64,9 @@ func main() {
 	commands.Flags().BoolP("raw", "R", false, "Enable raw output")
 	commands.Flags().Bool("reflected", false, "Enable reflected payload detection")
 	commands.Flags().String("reflected-output", "", "File path to store reflected findings")
+	commands.Flags().Bool("dom-dedup", false, "Enable DOM structural deduplication")
+	commands.Flags().Int("dom-dedup-threshold", 6, "Hamming threshold for DOM dedup")
+	commands.Flags().Int("baseline-fuzz-cap", 2, "Maximum baseline fuzz mutations per parameter")
 
 	commands.Flags().SortFlags = false
 	if err := commands.Execute(); err != nil {

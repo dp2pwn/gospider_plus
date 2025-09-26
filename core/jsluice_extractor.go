@@ -14,6 +14,7 @@ type JSRequest struct {
 	Headers     map[string]string
 	ContentType string
 	Source      string
+	Events      []string
 }
 
 type jsOptions struct {

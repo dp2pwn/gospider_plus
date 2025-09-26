@@ -42,6 +42,9 @@ type CrawlerConfig struct {
 	Blacklist       string
 	Whitelist       string
 	WhitelistDomain string
+	DomDedup        bool
+	DomDedupThresh  int
+	BaselineFuzzCap int
 }
 
 // NewCrawlerConfig extracts crawler configuration from CLI flags.
@@ -87,7 +90,20 @@ func NewCrawlerConfig(cmd *cobra.Command) CrawlerConfig {
 		Blacklist:       getString("blacklist"),
 		Whitelist:       getString("whitelist"),
 		WhitelistDomain: getString("whitelist-domain"),
-		Intensity:       IntensityUltra,
+		DomDedup:        getBool("dom-dedup"),
+		DomDedupThresh: func() int {
+			if v := getInt("dom-dedup-threshold"); v > 0 {
+				return v
+			}
+			return 6
+		}(),
+		BaselineFuzzCap: func() int {
+			if v := getInt("baseline-fuzz-cap"); v > 0 {
+				return v
+			}
+			return 2
+		}(),
+		Intensity: IntensityUltra,
 	}
 
 	if cfg.ReflectedOutput != "" {

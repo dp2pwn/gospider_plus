@@ -3,10 +3,14 @@ package core
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"html"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -14,9 +18,11 @@ import (
 	jsoniter "github.com/json-iterator/go"
 )
 
-const defaultReflectedPayload = "\"><u>1111</u>'\""
+const defaultReflectedPayload = "__gospider_reflected__"
 
 const reflectedParamName = "gospider_ref"
+
+var templateMarkerRegex = regexp.MustCompile(`(?i)\[object [^\]]+\]([0-9]+)\[object [^\]]+\]`)
 
 type reflectionEntry struct {
 	baselineSet     bool
@@ -33,6 +39,7 @@ type reflectionEntry struct {
 	origin          string
 	param           string
 	payload         string
+	mutatedMarkers  []string
 	emitted         bool
 }
 
@@ -50,6 +57,7 @@ type reflectionFinding struct {
 type reflectionMutation struct {
 	Request JSRequest
 	Param   string
+	Payload string
 }
 
 func (crawler *Crawler) processGeneratedRequest(req JSRequest, origin string, parentDepth int) {
@@ -118,16 +126,23 @@ func (crawler *Crawler) normalizeJSRequest(req JSRequest, origin string) (JSRequ
 
 func (crawler *Crawler) scheduleJSRequest(req JSRequest, origin string, parentDepth int) {
 	key := buildRequestKey(req)
-	crawler.queueRequest(req, origin, false, key, parentDepth, "")
-	if crawler.reflected {
-		mutations := crawler.buildReflectedRequests(req)
-		for _, mutation := range mutations {
-			crawler.queueRequest(mutation.Request, origin, true, key, parentDepth, mutation.Param)
-		}
+	crawler.queueRequest(req, origin, false, key, parentDepth, "", "")
+
+	budget := crawler.baselineFuzzCap
+	aggressive := crawler.reflected
+	if aggressive {
+		budget = len(crawler.payloadVariants)
+	}
+	if budget == 0 {
+		return
+	}
+	mutations := crawler.buildReflectedRequests(req, aggressive, budget)
+	for _, mutation := range mutations {
+		crawler.queueRequest(mutation.Request, origin, aggressive, key, parentDepth, mutation.Param, mutation.Payload)
 	}
 }
 
-func (crawler *Crawler) queueRequest(req JSRequest, origin string, reflected bool, baselineKey string, parentDepth int, paramName string) {
+func (crawler *Crawler) queueRequest(req JSRequest, origin string, reflected bool, baselineKey string, parentDepth int, paramName string, payload string) {
 	if parentDepth < 0 {
 		parentDepth = 0
 	}
@@ -165,12 +180,18 @@ func (crawler *Crawler) queueRequest(req JSRequest, origin string, reflected boo
 		baselineKey = buildRequestKey(req)
 	}
 	ctx.Put("request-key", baselineKey)
+	if len(req.Events) > 0 {
+		ctx.Put("events", strings.Join(req.Events, ","))
+	}
 	if reflected {
+		if payload == "" {
+			payload = crawler.reflectedPayload
+		}
 		if paramName == "" {
 			paramName = reflectedParamName
 		}
 		ctx.Put("reflected", "true")
-		ctx.Put("payload", crawler.reflectedPayload)
+		ctx.Put("payload", payload)
 		ctx.Put("param", paramName)
 	}
 
@@ -182,9 +203,13 @@ func (crawler *Crawler) queueRequest(req JSRequest, origin string, reflected boo
 				paramName = reflectedParamName
 			}
 			entry.param = paramName
-			entry.payload = crawler.reflectedPayload
+			entry.payload = payload
 		}
 		crawler.reflectedMutex.Unlock()
+	}
+
+	if payload != "" {
+		crawler.maybeThrottleMutations(reflected)
 	}
 
 	if err := crawler.C.Request(method, req.RawURL, bodyReader, ctx, headers); err != nil {
@@ -192,10 +217,31 @@ func (crawler *Crawler) queueRequest(req JSRequest, origin string, reflected boo
 	}
 }
 
-func (crawler *Crawler) buildReflectedRequests(req JSRequest) []reflectionMutation {
-	mutations := make([]reflectionMutation, 0)
-	payload := crawler.reflectedPayload
+func (crawler *Crawler) buildReflectedRequests(req JSRequest, aggressive bool, budget int) []reflectionMutation {
+	payloads := crawler.pickPayloads(budget, aggressive)
+	if len(payloads) == 0 {
+		return nil
+	}
 
+	remaining := budget
+	if remaining <= 0 || remaining > len(payloads) {
+		remaining = len(payloads)
+	}
+	if remaining <= 0 {
+		remaining = len(payloads)
+	}
+	index := 0
+	nextPayload := func() (string, bool) {
+		if remaining <= 0 {
+			return "", false
+		}
+		payload := payloads[index%len(payloads)]
+		index++
+		remaining--
+		return payload, true
+	}
+
+	mutations := make([]reflectionMutation, 0, len(payloads))
 	method := strings.ToUpper(req.Method)
 	if method == "" {
 		method = http.MethodGet
@@ -203,19 +249,21 @@ func (crawler *Crawler) buildReflectedRequests(req JSRequest) []reflectionMutati
 
 	if u, err := url.Parse(req.RawURL); err == nil {
 		values := u.Query()
-		if len(values) > 0 {
-			for key := range values {
-				if key == "" {
-					continue
-				}
-				cloned := cloneValues(values)
-				mutatedURL := *u
-				cloned.Set(key, payload)
-				mutatedURL.RawQuery = cloned.Encode()
-				mutated := req
-				mutated.RawURL = mutatedURL.String()
-				mutations = append(mutations, reflectionMutation{Request: mutated, Param: key})
+		for key := range values {
+			if strings.TrimSpace(key) == "" {
+				continue
 			}
+			payload, ok := nextPayload()
+			if !ok {
+				break
+			}
+			cloned := cloneValues(values)
+			mutatedURL := *u
+			cloned.Set(key, payload)
+			mutatedURL.RawQuery = cloned.Encode()
+			mutated := req
+			mutated.RawURL = mutatedURL.String()
+			mutations = append(mutations, reflectionMutation{Request: mutated, Param: key, Payload: payload})
 		}
 	}
 
@@ -225,11 +273,16 @@ func (crawler *Crawler) buildReflectedRequests(req JSRequest) []reflectionMutati
 			contentType = strings.ToLower(ct)
 		}
 	}
-	if strings.Contains(contentType, "application/x-www-form-urlencoded") {
+
+	if remaining > 0 && strings.Contains(contentType, "application/x-www-form-urlencoded") {
 		if values, err := url.ParseQuery(req.Body); err == nil && len(values) > 0 {
 			for key := range values {
-				if key == "" {
+				if strings.TrimSpace(key) == "" {
 					continue
+				}
+				payload, ok := nextPayload()
+				if !ok {
+					break
 				}
 				cloned := cloneValues(values)
 				cloned.Set(key, payload)
@@ -238,51 +291,319 @@ func (crawler *Crawler) buildReflectedRequests(req JSRequest) []reflectionMutati
 				if mutated.ContentType == "" {
 					mutated.ContentType = "application/x-www-form-urlencoded"
 				}
-				mutations = append(mutations, reflectionMutation{Request: mutated, Param: key})
+				mutations = append(mutations, reflectionMutation{Request: mutated, Param: key, Payload: payload})
 			}
 		}
+	}
+
+	if remaining > 0 && (strings.Contains(contentType, "application/json") || looksLikeJSON(req.Body)) {
+		jsonMutations := crawler.fuzzJSONBody(req, nextPayload)
+		mutations = append(mutations, jsonMutations...)
+	}
+
+	if remaining > 0 && strings.Contains(contentType, "multipart/form-data") {
+		multipartMutations := crawler.fuzzMultipartBody(req, contentType, nextPayload)
+		mutations = append(mutations, multipartMutations...)
 	}
 
 	if len(mutations) == 0 {
-		mutated := req
-		paramName := reflectedParamName
-
-		switch method {
-		case http.MethodGet, http.MethodHead:
-			if u, err := url.Parse(mutated.RawURL); err == nil {
-				values := u.Query()
-				values.Set(paramName, payload)
-				u.RawQuery = values.Encode()
-				mutated.RawURL = u.String()
-			} else {
-				separator := "?"
-				if strings.Contains(mutated.RawURL, "?") {
-					separator = "&"
+		payload, ok := nextPayload()
+		if ok {
+			mutated := req
+			paramName := reflectedParamName
+			switch method {
+			case http.MethodGet, http.MethodHead:
+				if u, err := url.Parse(mutated.RawURL); err == nil {
+					values := u.Query()
+					values.Set(paramName, payload)
+					u.RawQuery = values.Encode()
+					mutated.RawURL = u.String()
+				} else {
+					separator := "?"
+					if strings.Contains(mutated.RawURL, "?") {
+						separator = "&"
+					}
+					mutated.RawURL = mutated.RawURL + separator + paramName + "=" + url.QueryEscape(payload)
 				}
-				mutated.RawURL = mutated.RawURL + separator + paramName + "=" + url.QueryEscape(payload)
+			default:
+				if strings.Contains(contentType, "application/x-www-form-urlencoded") || contentType == "" {
+					values, err := url.ParseQuery(mutated.Body)
+					if err != nil {
+						values = url.Values{}
+					}
+					values.Set(paramName, payload)
+					mutated.Body = values.Encode()
+					if mutated.ContentType == "" {
+						mutated.ContentType = "application/x-www-form-urlencoded"
+					}
+				} else if mutated.Body == "" {
+					mutated.Body = payload
+				} else {
+					mutated.Body = mutated.Body + "&" + paramName + "=" + url.QueryEscape(payload)
+				}
 			}
-		default:
-			if strings.Contains(contentType, "application/x-www-form-urlencoded") || contentType == "" {
-				values, err := url.ParseQuery(mutated.Body)
-				if err != nil {
-					values = url.Values{}
-				}
-				values.Set(paramName, payload)
-				mutated.Body = values.Encode()
-				if mutated.ContentType == "" {
-					mutated.ContentType = "application/x-www-form-urlencoded"
-				}
-			} else if mutated.Body == "" {
-				mutated.Body = payload
-			} else {
-				mutated.Body = mutated.Body + "&" + paramName + "=" + url.QueryEscape(payload)
-			}
+			mutations = append(mutations, reflectionMutation{Request: mutated, Param: paramName, Payload: payload})
 		}
-
-		mutations = append(mutations, reflectionMutation{Request: mutated, Param: paramName})
 	}
 
 	return mutations
+}
+
+func (crawler *Crawler) pickPayloads(limit int, aggressive bool) []string {
+	var variants []PayloadVariant
+	if aggressive {
+		variants = crawler.payloadVariants
+	} else {
+		variants = crawler.baselinePayloads
+	}
+	if len(variants) == 0 {
+		if crawler.reflectedPayload != "" {
+			return []string{crawler.reflectedPayload}
+		}
+		return nil
+	}
+	if limit <= 0 || limit > len(variants) {
+		limit = len(variants)
+	}
+	indexes := crawler.sampleVariantIndexes(len(variants), limit)
+	payloads := make([]string, 0, len(indexes))
+	for _, idx := range indexes {
+		payloads = append(payloads, variants[idx].Render(crawler.reflectedPayload))
+	}
+	return payloads
+}
+
+func (crawler *Crawler) sampleVariantIndexes(size, count int) []int {
+	if count >= size {
+		count = size
+	}
+	if count <= 0 {
+		return nil
+	}
+	crawler.payloadRNGMutex.Lock()
+	rng := crawler.payloadRNG
+	crawler.payloadRNGMutex.Unlock()
+	if rng == nil {
+		idxs := make([]int, count)
+		for i := 0; i < count; i++ {
+			idxs[i] = i
+		}
+		return idxs
+	}
+	perm := rng.Perm(size)
+	return perm[:count]
+}
+
+func looksLikeJSON(body string) bool {
+	trimmed := strings.TrimSpace(body)
+	if trimmed == "" {
+		return false
+	}
+	first := trimmed[0]
+	return first == '{' || first == '['
+}
+
+type jsonPathSegment struct {
+	key     string
+	index   int
+	isIndex bool
+}
+
+func (crawler *Crawler) fuzzJSONBody(req JSRequest, next func() (string, bool)) []reflectionMutation {
+	trimmed := strings.TrimSpace(req.Body)
+	if trimmed == "" {
+		return nil
+	}
+	var data interface{}
+	if err := json.Unmarshal([]byte(req.Body), &data); err != nil {
+		return nil
+	}
+	paths := make([][]jsonPathSegment, 0, 8)
+	collectJSONPaths(data, nil, &paths)
+	if len(paths) == 0 {
+		return nil
+	}
+	mutations := make([]reflectionMutation, 0, len(paths))
+	for _, path := range paths {
+		payload, ok := next()
+		if !ok {
+			break
+		}
+		clone := cloneJSON(data)
+		setJSONValue(clone, path, payload)
+		buf, err := json.Marshal(clone)
+		if err != nil {
+			continue
+		}
+		mutated := req
+		mutated.Body = string(buf)
+		if mutated.ContentType == "" {
+			mutated.ContentType = "application/json"
+		}
+		param := formatJSONPath(path)
+		if param == "" {
+			param = reflectedParamName
+		}
+		mutations = append(mutations, reflectionMutation{Request: mutated, Param: param, Payload: payload})
+	}
+	return mutations
+}
+
+func (crawler *Crawler) fuzzMultipartBody(req JSRequest, contentType string, next func() (string, bool)) []reflectionMutation {
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err != nil || !strings.Contains(mediaType, "multipart/form-data") {
+		return nil
+	}
+	boundary := params["boundary"]
+	if boundary == "" {
+		return nil
+	}
+	payload, ok := next()
+	if !ok {
+		return nil
+	}
+
+	terminator := "--" + boundary + "--"
+	body := strings.TrimSuffix(req.Body, terminator)
+	if !strings.HasSuffix(body, "\r\n") {
+		body += "\r\n"
+	}
+
+	builder := strings.Builder{}
+	builder.WriteString(body)
+	builder.WriteString("--")
+	builder.WriteString(boundary)
+	builder.WriteString("\\r\\nContent-Disposition: form-data; name=\"")
+	builder.WriteString(reflectedParamName)
+	builder.WriteString("\"\\r\\n\\r\\n")
+	builder.WriteString(payload)
+	builder.WriteString("\r\n--")
+	builder.WriteString(boundary)
+	builder.WriteString("--")
+
+	mutated := req
+	mutated.Body = builder.String()
+	if mutated.ContentType == "" {
+		mutated.ContentType = mediaType + "; boundary=" + boundary
+	}
+
+	return []reflectionMutation{{Request: mutated, Param: reflectedParamName, Payload: payload}}
+}
+
+func collectJSONPaths(node interface{}, prefix []jsonPathSegment, out *[][]jsonPathSegment) {
+	switch val := node.(type) {
+	case map[string]interface{}:
+		for key, child := range val {
+			collectJSONPaths(child, append(prefix, jsonPathSegment{key: key}), out)
+		}
+	case []interface{}:
+		for idx, child := range val {
+			collectJSONPaths(child, append(prefix, jsonPathSegment{index: idx, isIndex: true}), out)
+		}
+	default:
+		pathCopy := make([]jsonPathSegment, len(prefix))
+		copy(pathCopy, prefix)
+		*out = append(*out, pathCopy)
+	}
+}
+
+func cloneJSON(node interface{}) interface{} {
+	switch val := node.(type) {
+	case map[string]interface{}:
+		dup := make(map[string]interface{}, len(val))
+		for k, v := range val {
+			dup[k] = cloneJSON(v)
+		}
+		return dup
+	case []interface{}:
+		dup := make([]interface{}, len(val))
+		for i, v := range val {
+			dup[i] = cloneJSON(v)
+		}
+		return dup
+	default:
+		return val
+	}
+}
+
+func setJSONValue(root interface{}, path []jsonPathSegment, value string) {
+	if len(path) == 0 {
+		return
+	}
+	current := root
+	for i := 0; i < len(path)-1; i++ {
+		seg := path[i]
+		if seg.isIndex {
+			arr, ok := current.([]interface{})
+			if !ok || seg.index < 0 || seg.index >= len(arr) {
+				return
+			}
+			current = arr[seg.index]
+		} else {
+			obj, ok := current.(map[string]interface{})
+			if !ok {
+				return
+			}
+			current = obj[seg.key]
+		}
+	}
+	last := path[len(path)-1]
+	switch container := current.(type) {
+	case map[string]interface{}:
+		if !last.isIndex {
+			container[last.key] = value
+		}
+	case []interface{}:
+		if last.isIndex && last.index >= 0 && last.index < len(container) {
+			container[last.index] = value
+		}
+	}
+}
+
+func formatJSONPath(path []jsonPathSegment) string {
+	if len(path) == 0 {
+		return ""
+	}
+	var builder strings.Builder
+	for _, seg := range path {
+		if seg.isIndex {
+			builder.WriteString("[")
+			builder.WriteString(strconv.Itoa(seg.index))
+			builder.WriteString("]")
+		} else {
+			if builder.Len() > 0 {
+				builder.WriteString(".")
+			}
+			builder.WriteString(seg.key)
+		}
+	}
+	return builder.String()
+}
+
+func findEncodedPayloads(body []byte, payload string) []string {
+	reasons := make([]string, 0, 3)
+	lowerBody := strings.ToLower(string(body))
+	if payload != "" && strings.Contains(lowerBody, strings.ToLower(payload)) {
+		reasons = append(reasons, "payload-reflected")
+	}
+	htmlEncoded := html.EscapeString(payload)
+	if htmlEncoded != payload && strings.Contains(lowerBody, strings.ToLower(htmlEncoded)) {
+		reasons = append(reasons, "payload-html-encoded")
+	}
+	urlEncoded := url.QueryEscape(payload)
+	if urlEncoded != payload && strings.Contains(lowerBody, strings.ToLower(urlEncoded)) {
+		reasons = append(reasons, "payload-url-encoded")
+	}
+	return reasons
+}
+
+func appendUniqueMarker(list []string, marker string) []string {
+	for _, existing := range list {
+		if existing == marker {
+			return list
+		}
+	}
+	return append(list, marker)
 }
 
 func (crawler *Crawler) handleBaselineReflection(response *colly.Response) {
@@ -330,8 +651,19 @@ func (crawler *Crawler) handleReflectedResponse(response *colly.Response) {
 		return
 	}
 
+	payload := response.Ctx.Get("payload")
+	if payload == "" {
+		payload = crawler.reflectedPayload
+	}
+
 	body := response.Body
-	contains := strings.Contains(string(body), crawler.reflectedPayload)
+	reasons := findEncodedPayloads(body, payload)
+	contains := len(reasons) > 0
+	if templateMarkerRegex.Match(body) {
+		contains = true
+		reasons = appendUniqueMarker(reasons, "template-marker")
+	}
+
 	hash := hashBody(body)
 
 	crawler.reflectedMutex.Lock()
@@ -341,6 +673,7 @@ func (crawler *Crawler) handleReflectedResponse(response *colly.Response) {
 	entry.mutatedStatus = response.StatusCode
 	entry.mutatedLen = len(body)
 	entry.mutatedContains = contains
+	entry.mutatedMarkers = reasons
 	entry.url = response.Request.URL.String()
 	if entry.method == "" {
 		entry.method = response.Ctx.Get("method")
@@ -351,7 +684,7 @@ func (crawler *Crawler) handleReflectedResponse(response *colly.Response) {
 	if param := response.Ctx.Get("param"); param != "" {
 		entry.param = param
 	}
-	if payload := response.Ctx.Get("payload"); payload != "" {
+	if payload != "" {
 		entry.payload = payload
 	}
 	finding := entry.evaluate()
@@ -394,12 +727,15 @@ func (entry *reflectionEntry) evaluate() *reflectionFinding {
 		return nil
 	}
 
-	reasons := make([]string, 0, 2)
-	if entry.mutatedContains {
-		reasons = append(reasons, "payload-reflected")
+	reasons := make([]string, 0, 3+len(entry.mutatedMarkers))
+	if entry.mutatedContains && len(entry.mutatedMarkers) == 0 {
+		reasons = appendUniqueMarker(reasons, "payload-reflected")
+	}
+	for _, marker := range entry.mutatedMarkers {
+		reasons = appendUniqueMarker(reasons, marker)
 	}
 	if entry.baselineHash != entry.mutatedHash {
-		reasons = append(reasons, "body-delta")
+		reasons = appendUniqueMarker(reasons, "body-delta")
 	}
 	if len(reasons) == 0 {
 		return nil

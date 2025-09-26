@@ -3,6 +3,7 @@ package core
 import (
 	"bufio"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -53,6 +54,17 @@ type Crawler struct {
 	backoffError     int
 
 	filterLength_slice []int
+	domDedup           bool
+	domDedupThresh     int
+	domDeduper         *DOMDeduper
+	domSkip            map[string]bool
+	domSkipMu          sync.RWMutex
+	baselineFuzzCap    int
+	payloadVariants    []PayloadVariant
+	baselinePayloads   []PayloadVariant
+	payloadRNG         *rand.Rand
+	payloadRNGMutex    sync.Mutex
+	domAnalyzer        *DOMAnalyzer
 }
 
 type SpiderOutput struct {
@@ -64,6 +76,8 @@ type SpiderOutput struct {
 	Length     int    `json:"length"`
 	Param      string `json:"param,omitempty"`
 	Payload    string `json:"payload,omitempty"`
+	Confidence string `json:"confidence,omitempty"`
+	Snippet    string `json:"snippet,omitempty"`
 }
 
 func (crawler *Crawler) isDuplicateURL(raw string) bool {
@@ -91,6 +105,85 @@ func (crawler *Crawler) isDuplicateRequest(method, raw, body string) bool {
 		return crawler.urlSet.Duplicate(value)
 	}
 	return false
+}
+
+func (crawler *Crawler) shouldSkipDOM(raw string) bool {
+	if !crawler.domDedup {
+		return false
+	}
+	crawler.domSkipMu.RLock()
+	defer crawler.domSkipMu.RUnlock()
+	return crawler.domSkip != nil && crawler.domSkip[raw]
+}
+
+func (crawler *Crawler) setDOMSkip(raw string, skip bool) {
+	if !crawler.domDedup {
+		return
+	}
+	if crawler.domSkip == nil {
+		crawler.domSkip = make(map[string]bool)
+	}
+	crawler.domSkipMu.Lock()
+	if skip {
+		crawler.domSkip[raw] = true
+	} else {
+		delete(crawler.domSkip, raw)
+	}
+	crawler.domSkipMu.Unlock()
+}
+
+func (crawler *Crawler) emitDOMFindings(url, body, sourceLabel string) {
+	if crawler.domAnalyzer == nil {
+		return
+	}
+	findings := crawler.domAnalyzer.Analyze(url, body, sourceLabel)
+	if len(findings) == 0 {
+		return
+	}
+	for _, finding := range findings {
+		rendered := fmt.Sprintf("[dom-sink] - [%s] %s -> %s", finding.Confidence, finding.Source, finding.Sink)
+		if finding.Snippet != "" {
+			rendered = fmt.Sprintf("%s :: %s", rendered, finding.Snippet)
+		}
+		output := rendered
+		if crawler.JsonOutput {
+			sout := SpiderOutput{
+				Input:      crawler.Input,
+				Source:     finding.Source,
+				OutputType: "dom-sink",
+				Output:     url,
+				Param:      finding.Sink,
+				Payload:    finding.Snippet,
+				Confidence: finding.Confidence,
+				Snippet:    finding.Snippet,
+			}
+			if data, err := jsoniter.MarshalToString(sout); err == nil {
+				output = data
+			}
+		} else if crawler.Quiet {
+			output = fmt.Sprintf("%s %s", url, finding.Sink)
+		}
+		fmt.Println(output)
+		if crawler.Output != nil {
+			crawler.Output.WriteToFile(output)
+		}
+	}
+}
+func (crawler *Crawler) maybeThrottleMutations(reflected bool) {
+	if reflected {
+		return
+	}
+	if crawler.baselineFuzzCap <= 0 {
+		return
+	}
+	crawler.payloadRNGMutex.Lock()
+	rng := crawler.payloadRNG
+	crawler.payloadRNGMutex.Unlock()
+	if rng == nil {
+		return
+	}
+	wait := 50 + rng.Intn(120)
+	time.Sleep(time.Duration(wait) * time.Millisecond)
 }
 
 func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
@@ -304,6 +397,17 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 		linkFinderCollector.URLFilters = append(linkFinderCollector.URLFilters, regexp.MustCompile("http(s)?://"+cfg.WhitelistDomain))
 	}
 
+	payloadVariants := DefaultPayloadVariants()
+	baselinePayloads := SelectBaselinePayloads(payloadVariants)
+	if len(baselinePayloads) == 0 {
+		baselinePayloads = payloadVariants
+	}
+	var domDeduper *DOMDeduper
+	if cfg.DomDedup {
+		domDeduper = NewDOMDeduper(cfg.DomDedupThresh)
+	}
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+
 	return &Crawler{
 		C:                   c,
 		LinkFinderCollector: linkFinderCollector,
@@ -329,6 +433,15 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 		reflectedPayload:    defaultReflectedPayload,
 		reflectedStore:      make(map[string]*reflectionEntry),
 		filterLength_slice:  filterLengthSlice,
+		domDedup:            cfg.DomDedup,
+		domDedupThresh:      cfg.DomDedupThresh,
+		domDeduper:          domDeduper,
+		domSkip:             make(map[string]bool),
+		baselineFuzzCap:     cfg.BaselineFuzzCap,
+		payloadVariants:     payloadVariants,
+		baselinePayloads:    baselinePayloads,
+		payloadRNG:          rng,
+		domAnalyzer:         NewDOMAnalyzer(),
 	}
 }
 
@@ -422,6 +535,9 @@ func (crawler *Crawler) Start(linkfinder bool) {
 
 	// Handle url
 	crawler.C.OnHTML("[href]", func(e *colly.HTMLElement) {
+		if crawler.shouldSkipDOM(e.Request.URL.String()) {
+			return
+		}
 		raw := e.Attr("href")
 		urlString, ok := NormalizeURL(e.Request.URL, raw)
 		if !ok {
@@ -455,6 +571,9 @@ func (crawler *Crawler) Start(linkfinder bool) {
 
 	// Handle form
 	crawler.C.OnHTML("form", func(e *colly.HTMLElement) {
+		if crawler.shouldSkipDOM(e.Request.URL.String()) {
+			return
+		}
 		formURL := e.Request.URL.String()
 		if !crawler.formSet.Duplicate(formURL) {
 			outputFormat := fmt.Sprintf("[form] - %s", formURL)
@@ -487,6 +606,9 @@ func (crawler *Crawler) Start(linkfinder bool) {
 	// Find Upload Form
 	uploadFormSet := stringset.NewStringFilter()
 	crawler.C.OnHTML(`input[type="file"]`, func(e *colly.HTMLElement) {
+		if crawler.shouldSkipDOM(e.Request.URL.String()) {
+			return
+		}
 		uploadUrl := e.Request.URL.String()
 		if !uploadFormSet.Duplicate(uploadUrl) {
 			outputFormat := fmt.Sprintf("[upload-form] - %s", uploadUrl)
@@ -513,6 +635,9 @@ func (crawler *Crawler) Start(linkfinder bool) {
 
 	// Handle js files
 	crawler.C.OnHTML("[src]", func(e *colly.HTMLElement) {
+		if crawler.shouldSkipDOM(e.Request.URL.String()) {
+			return
+		}
 		jsFileUrl, ok := NormalizeURL(e.Request.URL, e.Attr("src"))
 		if !ok {
 			jsFileUrl, ok = NormalizeURL(crawler.site, e.Attr("src"))
@@ -535,12 +660,47 @@ func (crawler *Crawler) Start(linkfinder bool) {
 		if crawler.reflected {
 			crawler.handleBaselineReflection(response)
 		}
+
+		var urlStr string
+		if response.Request != nil && response.Request.URL != nil {
+			urlStr = response.Request.URL.String()
+		}
+		contentType := strings.ToLower(response.Headers.Get("Content-Type"))
+		if idx := strings.Index(contentType, ";"); idx != -1 {
+			contentType = strings.TrimSpace(contentType[:idx])
+		}
+		htmlLike := isLikelyHTML(contentType, response.Body)
+		jsLike := isLikelyJS(contentType, response.Body)
+		if crawler.domDedup && urlStr != "" {
+			if htmlLike && crawler.domDeduper != nil {
+				skip, _, err := crawler.domDeduper.ShouldSkip(crawler.domain, response.Body)
+				if err != nil {
+					Logger.Debugf("dom-dedup failed for %s: %v", urlStr, err)
+				} else {
+					crawler.setDOMSkip(urlStr, skip)
+					if skip {
+						Logger.Debugf("dom-dedup skip %s (threshold=%d)", urlStr, crawler.domDedupThresh)
+					}
+				}
+			} else {
+				crawler.setDOMSkip(urlStr, false)
+			}
+		}
+
 		duplicateContent := false
 		if crawler.registry != nil && response.Request != nil && response.Request.URL != nil {
 			duplicateContent = crawler.registry.MarkResponse(response.Request.Method, response.Request.URL.String(), response.Body)
 		}
 		crawler.recordBackoff(response.StatusCode)
 		respStr := DecodeChars(string(response.Body))
+
+		if crawler.domAnalyzer != nil && urlStr != "" && (htmlLike || jsLike) && !crawler.shouldSkipDOM(urlStr) {
+			sourceLabel := "html"
+			if jsLike && !htmlLike {
+				sourceLabel = "javascript"
+			}
+			crawler.emitDOMFindings(urlStr, respStr, sourceLabel)
+		}
 
 		if len(crawler.filterLength_slice) == 0 || !contains(crawler.filterLength_slice, len(respStr)) {
 			if duplicateContent {
