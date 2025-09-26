@@ -6,7 +6,6 @@ import (
 	"math/bits"
 	"strings"
 	"sync"
-	"unicode"
 
 	"github.com/PuerkitoBio/goquery"
 )
@@ -76,20 +75,11 @@ func ComputeDOMSignature(body []byte) (uint64, error) {
 			if name == "style" {
 				continue
 			}
-			value := normaliseDOMToken(attr.Val)
-			if value != "" {
-				features = append(features, "attr:"+name+"="+value)
-			} else {
-				features = append(features, "attr:"+name)
-			}
+			features = append(features, "attr:"+name)
 		}
 		if tag != "script" && tag != "style" {
-			text := normaliseDOMToken(sel.Text())
-			if text != "" {
-				if len(text) > 96 {
-					text = text[:96]
-				}
-				features = append(features, "text:"+text)
+			if strings.TrimSpace(sel.Text()) != "" {
+				features = append(features, "text:present")
 			}
 		}
 		if len(features) >= 2048 {
@@ -132,30 +122,6 @@ func simhash(features []string) uint64 {
 // HammingDistance calculates the Hamming distance between two 64-bit signatures.
 func HammingDistance(a, b uint64) int {
 	return bits.OnesCount64(a ^ b)
-}
-
-func normaliseDOMToken(val string) string {
-	val = strings.ToLower(val)
-	var builder strings.Builder
-	builder.Grow(len(val))
-	lastSpace := false
-	for _, r := range val {
-		switch {
-		case unicode.IsDigit(r):
-			continue
-		case unicode.IsSpace(r):
-			if !lastSpace && builder.Len() > 0 {
-				builder.WriteByte(' ')
-			}
-			lastSpace = true
-		case unicode.IsLetter(r) || unicode.IsNumber(r) || r == '-' || r == '_' || r == '.':
-			builder.WriteRune(r)
-			lastSpace = false
-		default:
-			lastSpace = false
-		}
-	}
-	return strings.TrimSpace(builder.String())
 }
 
 func isLikelyHTML(contentType string, body []byte) bool {
