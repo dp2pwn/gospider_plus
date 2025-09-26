@@ -580,19 +580,35 @@ func formatJSONPath(path []jsonPathSegment) string {
 	return builder.String()
 }
 
-func findEncodedPayloads(body []byte, payload string) []string {
-	reasons := make([]string, 0, 3)
+func findEncodedPayloads(body []byte, payload string, sentinel string) []string {
+	reasons := make([]string, 0, 6)
 	lowerBody := strings.ToLower(string(body))
-	if payload != "" && strings.Contains(lowerBody, strings.ToLower(payload)) {
-		reasons = append(reasons, "payload-reflected")
+	add := func(marker string) {
+		reasons = appendUniqueMarker(reasons, marker)
 	}
-	htmlEncoded := html.EscapeString(payload)
-	if htmlEncoded != payload && strings.Contains(lowerBody, strings.ToLower(htmlEncoded)) {
-		reasons = append(reasons, "payload-html-encoded")
+	if payload != "" {
+		lowerPayload := strings.ToLower(payload)
+		if strings.Contains(lowerBody, lowerPayload) {
+			add("payload-reflected")
+		}
+		if htmlEncoded := strings.ToLower(html.EscapeString(payload)); htmlEncoded != lowerPayload && strings.Contains(lowerBody, htmlEncoded) {
+			add("payload-html-encoded")
+		}
+		if urlEncoded := strings.ToLower(url.QueryEscape(payload)); urlEncoded != lowerPayload && strings.Contains(lowerBody, urlEncoded) {
+			add("payload-url-encoded")
+		}
 	}
-	urlEncoded := url.QueryEscape(payload)
-	if urlEncoded != payload && strings.Contains(lowerBody, strings.ToLower(urlEncoded)) {
-		reasons = append(reasons, "payload-url-encoded")
+	if sentinel != "" {
+		lowerSentinel := strings.ToLower(sentinel)
+		if !strings.EqualFold(payload, sentinel) && strings.Contains(lowerBody, lowerSentinel) {
+			add("payload-sentinel")
+		}
+		if htmlSentinel := strings.ToLower(html.EscapeString(sentinel)); htmlSentinel != lowerSentinel && strings.Contains(lowerBody, htmlSentinel) {
+			add("payload-sentinel-html")
+		}
+		if urlSentinel := strings.ToLower(url.QueryEscape(sentinel)); urlSentinel != lowerSentinel && strings.Contains(lowerBody, urlSentinel) {
+			add("payload-sentinel-url")
+		}
 	}
 	return reasons
 }
@@ -657,7 +673,7 @@ func (crawler *Crawler) handleReflectedResponse(response *colly.Response) {
 	}
 
 	body := response.Body
-	reasons := findEncodedPayloads(body, payload)
+	reasons := findEncodedPayloads(body, payload, crawler.reflectedPayload)
 	contains := len(reasons) > 0
 	if templateMarkerRegex.Match(body) {
 		contains = true
