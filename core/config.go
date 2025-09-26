@@ -16,38 +16,44 @@ const (
 
 // CrawlerConfig captures CLI options that influence crawler behavior.
 type CrawlerConfig struct {
-	Registry        *URLRegistry
-	Intensity       ExtractorIntensity
-	Quiet           bool
-	JSONOutput      bool
-	MaxDepth        int
-	MaxConcurrency  int
-	Delay           time.Duration
-	RandomDelay     time.Duration
-	Length          bool
-	Raw             bool
-	Subs            bool
-	Reflected       bool
-	Stealth         bool
-	Proxy           string
-	Timeout         time.Duration
-	NoRedirect      bool
-	BurpFile        string
-	Cookie          string
-	Headers         []string
-	UserAgent       string
-	OutputDir       string
-	ReflectedOutput string
-	FilterLength    string
-	Blacklist       string
-	Whitelist       string
-	WhitelistDomain string
-	DomDedup        bool
-	DomDedupThresh  int
-	BaselineFuzzCap int
+	Registry                 *URLRegistry
+	Intensity                ExtractorIntensity
+	Quiet                    bool
+	JSONOutput               bool
+	MaxDepth                 int
+	MaxConcurrency           int
+	Delay                    time.Duration
+	RandomDelay              time.Duration
+	Length                   bool
+	Raw                      bool
+	Subs                     bool
+	Reflected                bool
+	Stealth                  bool
+	Proxy                    string
+	Timeout                  time.Duration
+	NoRedirect               bool
+	BurpFile                 string
+	Cookie                   string
+	Headers                  []string
+	UserAgent                string
+	OutputDir                string
+	ReflectedOutput          string
+	FilterLength             string
+	Blacklist                string
+	Whitelist                string
+	WhitelistDomain          string
+	DomDedup                 bool
+	DomDedupThresh           int
+	BaselineFuzzCap          int
+	HybridCrawl              bool
+	HybridWorkers            int
+	HybridNavigationTimeout  time.Duration
+	HybridStabilizationDelay time.Duration
+	HybridHeadless           bool
+	HybridInitScripts        []string
+	HybridVisitLimit         int
 }
 
-// NewCrawlerConfig extracts crawler configuration from CLI flags.
 func NewCrawlerConfig(cmd *cobra.Command) CrawlerConfig {
 	getBool := func(name string) bool {
 		v, _ := cmd.Flags().GetBool(name)
@@ -106,6 +112,30 @@ func NewCrawlerConfig(cmd *cobra.Command) CrawlerConfig {
 		Intensity: IntensityUltra,
 	}
 
+	cfg.HybridCrawl = getBool("hybrid")
+	cfg.HybridWorkers = getInt("hybrid-workers")
+	cfg.HybridNavigationTimeout = time.Duration(getInt("hybrid-nav-timeout")) * time.Second
+	cfg.HybridStabilizationDelay = time.Duration(getInt("hybrid-stabilization")) * time.Millisecond
+	cfg.HybridHeadless = getBool("hybrid-headless")
+	cfg.HybridInitScripts = func() []string {
+		v, _ := cmd.Flags().GetStringSlice("hybrid-init-script")
+		return v
+	}()
+	cfg.HybridVisitLimit = getInt("hybrid-max-visits")
+
+	if cfg.HybridNavigationTimeout <= 0 {
+		cfg.HybridNavigationTimeout = 12 * time.Second
+	}
+	if cfg.HybridStabilizationDelay <= 0 {
+		cfg.HybridStabilizationDelay = 600 * time.Millisecond
+	}
+	if cfg.HybridWorkers <= 0 {
+		cfg.HybridWorkers = 2
+	}
+
+	if cfg.HybridVisitLimit < 0 {
+		cfg.HybridVisitLimit = 0
+	}
 	if cfg.ReflectedOutput != "" {
 		cfg.Reflected = true
 	}

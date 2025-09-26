@@ -67,6 +67,13 @@ func main() {
 	commands.Flags().Bool("dom-dedup", false, "Enable DOM structural deduplication")
 	commands.Flags().Int("dom-dedup-threshold", 6, "Hamming threshold for DOM dedup")
 	commands.Flags().Int("baseline-fuzz-cap", 2, "Maximum baseline fuzz mutations per parameter")
+	commands.Flags().Bool("hybrid", false, "Enable state-aware hybrid crawling (requires Chromium)")
+	commands.Flags().Int("hybrid-workers", 2, "Number of concurrent browser workers for hybrid crawling")
+	commands.Flags().Int("hybrid-nav-timeout", 12, "Hybrid browser navigation timeout in seconds")
+	commands.Flags().Int("hybrid-stabilization", 600, "Extra wait after load before analysis in milliseconds")
+	commands.Flags().Bool("hybrid-headless", true, "Run hybrid browser workers in headless mode")
+	commands.Flags().StringSlice("hybrid-init-script", []string{}, "Inject JavaScript files into hybrid browsers before navigation")
+	commands.Flags().Int("hybrid-max-visits", 150, "Limit total pages explored by hybrid browser (0 = unlimited)")
 
 	commands.Flags().SortFlags = false
 	if err := commands.Execute(); err != nil {
@@ -235,6 +242,7 @@ func run(cmd *cobra.Command, _ []string) {
 				siteWg.Wait()
 				crawler.C.Wait()
 				crawler.LinkFinderCollector.Wait()
+				crawler.WaitHybrid()
 			}
 		}()
 	}

@@ -2,6 +2,7 @@ package core
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -65,6 +67,21 @@ type Crawler struct {
 	payloadRNG         *rand.Rand
 	payloadRNGMutex    sync.Mutex
 	domAnalyzer        *DOMAnalyzer
+	jsRequestLogSet    *stringset.StringFilter
+
+	hybridEnabled  bool
+	hybridWorkers  int
+	stateGraph     *ApplicationStateGraph
+	browserPool    *BrowserPool
+	hybridQueue    chan string
+	hybridVisited  *stringset.StringFilter
+	hybridAPISet   *stringset.StringFilter
+	hybridCtx      context.Context
+	hybridCancel   context.CancelFunc
+	hybridWG       sync.WaitGroup
+	hybridActive   atomic.Bool
+	hybridVisitCap int
+	hybridEnqueued int64
 }
 
 type SpiderOutput struct {
@@ -408,7 +425,7 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 	}
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	return &Crawler{
+	crawler := &Crawler{
 		C:                   c,
 		LinkFinderCollector: linkFinderCollector,
 		AntiDetectClient:    antiDetectClient,
@@ -443,6 +460,8 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 		payloadRNG:          rng,
 		domAnalyzer:         NewDOMAnalyzer(),
 	}
+	crawler.initializeHybrid(cfg)
+	return crawler
 }
 
 func (crawler *Crawler) feedLinkfinder(jsFileUrl string, OutputType string, source string) {
@@ -483,6 +502,9 @@ func (crawler *Crawler) feedLinkfinder(jsFileUrl string, OutputType string, sour
 }
 
 func (crawler *Crawler) emitJSRequest(req JSRequest, origin string) bool {
+	if crawler.jsRequestLogSet == nil {
+		crawler.jsRequestLogSet = stringset.NewStringFilter()
+	}
 	if crawler.jsRequestSet == nil {
 		crawler.jsRequestSet = stringset.NewStringFilter()
 	}
@@ -502,6 +524,11 @@ func (crawler *Crawler) emitJSRequest(req JSRequest, origin string) bool {
 		source = origin
 	}
 
+	displayKey := strings.ToUpper(method) + " " + strings.TrimSpace(req.RawURL)
+	shouldLog := true
+	if crawler.jsRequestLogSet.Duplicate(displayKey) {
+		shouldLog = false
+	}
 	rendered := fmt.Sprintf("[js-request] - [%s] %s", method, req.RawURL)
 	if crawler.JsonOutput {
 		sout := SpiderOutput{
@@ -518,10 +545,11 @@ func (crawler *Crawler) emitJSRequest(req JSRequest, origin string) bool {
 		rendered = strings.TrimSpace(method + " " + req.RawURL)
 	}
 
-	fmt.Println(rendered)
-
-	if crawler.Output != nil {
-		crawler.Output.WriteToFile(rendered)
+	if shouldLog {
+		fmt.Println(rendered)
+		if crawler.Output != nil {
+			crawler.Output.WriteToFile(rendered)
+		}
 	}
 
 	return true
@@ -671,6 +699,9 @@ func (crawler *Crawler) Start(linkfinder bool) {
 		}
 		htmlLike := isLikelyHTML(contentType, response.Body)
 		jsLike := isLikelyJS(contentType, response.Body)
+		if htmlLike && urlStr != "" {
+			crawler.enqueueHybrid(urlStr)
+		}
 		if crawler.domDedup && urlStr != "" {
 			if htmlLike && crawler.domDeduper != nil {
 				skip, _, err := crawler.domDeduper.ShouldSkip(crawler.domain, response.Body)
@@ -1127,4 +1158,272 @@ func (crawler *Crawler) setupLinkFinder() {
 			}
 		}
 	})
+}
+
+func (crawler *Crawler) initializeHybrid(cfg CrawlerConfig) {
+	if !cfg.HybridCrawl {
+		return
+	}
+
+	workers := cfg.HybridWorkers
+	if workers <= 0 {
+		workers = 2
+	}
+
+	navTimeout := cfg.HybridNavigationTimeout
+	if navTimeout <= 0 {
+		navTimeout = 12 * time.Second
+	}
+
+	stabilization := cfg.HybridStabilizationDelay
+	if stabilization <= 0 {
+		stabilization = 600 * time.Millisecond
+	}
+
+	headless := cfg.HybridHeadless
+	initScripts := make([]string, 0, len(cfg.HybridInitScripts))
+	for _, script := range cfg.HybridInitScripts {
+		script = strings.TrimSpace(script)
+		if script != "" {
+			initScripts = append(initScripts, script)
+		}
+	}
+
+	poolCfg := BrowserPoolConfig{
+		PoolSize:           workers,
+		NavigationTimeout:  navTimeout,
+		StabilizationDelay: stabilization,
+		Headless:           &headless,
+		InitScripts:        initScripts,
+	}
+
+	crawler.stateGraph = NewApplicationStateGraph()
+	crawler.browserPool = NewBrowserPool(poolCfg)
+
+	queueSize := workers * 4
+	if queueSize < 8 {
+		queueSize = 8
+	}
+	crawler.hybridQueue = make(chan string, queueSize)
+	crawler.hybridVisited = stringset.NewStringFilter()
+	crawler.hybridAPISet = stringset.NewStringFilter()
+	crawler.hybridWorkers = workers
+	crawler.hybridEnqueued = 0
+	crawler.hybridVisitCap = cfg.HybridVisitLimit
+	if crawler.hybridVisitCap <= 0 {
+		crawler.hybridVisitCap = 150
+	}
+
+	crawler.hybridCtx, crawler.hybridCancel = context.WithCancel(context.Background())
+
+	if err := crawler.browserPool.Initialize(crawler.hybridCtx); err != nil {
+		crawler.hybridActive.Store(false)
+		crawler.hybridCancel()
+		Logger.Errorf("hybrid mode disabled: %v", err)
+		crawler.browserPool = nil
+		crawler.stateGraph = nil
+		crawler.hybridQueue = nil
+		crawler.hybridVisited = nil
+		crawler.hybridAPISet = nil
+		crawler.hybridCancel = nil
+		crawler.hybridCtx = nil
+		return
+	}
+
+	crawler.hybridEnabled = true
+	crawler.hybridActive.Store(true)
+
+	for i := 0; i < workers; i++ {
+		crawler.hybridWG.Add(1)
+		go crawler.hybridWorker()
+	}
+
+	Logger.Infof("Hybrid state-aware crawling enabled (workers=%d, headless=%v)", workers, headless)
+	crawler.enqueueHybrid(crawler.site.String())
+}
+
+func (crawler *Crawler) hybridWorker() {
+	defer crawler.hybridWG.Done()
+	if crawler.hybridQueue == nil || crawler.hybridCtx == nil {
+		return
+	}
+
+	for {
+		select {
+		case <-crawler.hybridCtx.Done():
+			return
+		case url := <-crawler.hybridQueue:
+			if !crawler.hybridActive.Load() || url == "" {
+				continue
+			}
+			if crawler.browserPool == nil || crawler.stateGraph == nil {
+				continue
+			}
+			result, err := crawler.browserPool.NavigateAndAnalyze(crawler.hybridCtx, url, crawler.stateGraph)
+			if err != nil {
+				Logger.Debugf("hybrid analyze failed for %s: %v", url, err)
+				continue
+			}
+			crawler.handleHybridResult(result)
+		}
+	}
+}
+
+func (crawler *Crawler) enqueueHybrid(raw string) {
+	if !crawler.hybridEnabled || !crawler.hybridActive.Load() || crawler.hybridQueue == nil || crawler.hybridCtx == nil {
+		return
+	}
+
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return
+	}
+	if crawler.hybridVisited != nil && crawler.hybridVisited.Duplicate(raw) {
+		return
+	}
+
+	select {
+	case <-crawler.hybridCtx.Done():
+		return
+	case crawler.hybridQueue <- raw:
+	default:
+		Logger.Debugf("hybrid queue saturated, dropping %s", raw)
+	}
+}
+
+func (crawler *Crawler) handleHybridResult(result *PageAnalysisResult) {
+	if result == nil || crawler.stateGraph == nil {
+		return
+	}
+
+	crawler.stateGraph.MarkAnalyzed(result.StateHash)
+
+	if len(result.APICalls) > 0 {
+		crawler.emitHybridAPICalls(result.URL, result.APICalls)
+	}
+
+	for _, tr := range result.Transitions {
+		crawler.processHybridTransition(result.URL, tr)
+	}
+}
+
+func (crawler *Crawler) emitHybridAPICalls(origin string, calls []string) {
+	if crawler.hybridAPISet == nil {
+		crawler.hybridAPISet = stringset.NewStringFilter()
+	}
+
+	for _, call := range calls {
+		call = strings.TrimSpace(call)
+		if call == "" || crawler.hybridAPISet.Duplicate(call) {
+			continue
+		}
+
+		output := fmt.Sprintf("[hybrid][api] - %s", call)
+		if crawler.JsonOutput {
+			sout := SpiderOutput{
+				Input:      crawler.Input,
+				Source:     origin,
+				OutputType: "hybrid-api",
+				Output:     call,
+			}
+			if data, err := jsoniter.MarshalToString(sout); err == nil {
+				output = data
+			}
+		}
+
+		fmt.Println(output)
+		if crawler.Output != nil {
+			crawler.Output.WriteToFile(output)
+		}
+	}
+}
+
+func (crawler *Crawler) processHybridTransition(origin string, tr StateTransition) {
+	action := strings.ToLower(strings.TrimSpace(tr.ActionType))
+	if action == "" {
+		return
+	}
+
+	switch action {
+	case "navigate":
+		target := ""
+		if tr.Details != nil {
+			target = tr.Details["targetUrl"]
+		}
+		crawler.scheduleHybridVisit(origin, target)
+	case "form":
+		target := ""
+		if tr.Details != nil {
+			target = tr.Details["targetUrl"]
+			if target == "" {
+				target = tr.Details["action"]
+			}
+		}
+		crawler.scheduleHybridVisit(origin, target)
+	}
+}
+
+func (crawler *Crawler) scheduleHybridVisit(origin, candidate string) {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return
+	}
+
+	var base *url.URL
+	if origin != "" {
+		if parsed, err := url.Parse(origin); err == nil {
+			base = parsed
+		}
+	}
+
+	normalized, ok := NormalizeURL(base, candidate)
+	if !ok {
+		normalized, ok = NormalizeURL(crawler.site, candidate)
+		if !ok {
+			return
+		}
+	}
+
+	if !crawler.isDuplicateURL(normalized) {
+		_ = crawler.C.Visit(normalized)
+	}
+
+	crawler.enqueueHybrid(normalized)
+}
+
+func (crawler *Crawler) stopHybrid() {
+	if !crawler.hybridEnabled {
+		return
+	}
+
+	crawler.hybridActive.Store(false)
+	if crawler.hybridCancel != nil {
+		crawler.hybridCancel()
+	}
+}
+
+func (crawler *Crawler) WaitHybrid() {
+	if !crawler.hybridEnabled {
+		return
+	}
+
+	crawler.stopHybrid()
+	crawler.hybridWG.Wait()
+
+	if crawler.browserPool != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := crawler.browserPool.Shutdown(shutdownCtx); err != nil {
+			Logger.Debugf("hybrid browser shutdown: %v", err)
+		}
+	}
+
+	crawler.browserPool = nil
+	crawler.hybridQueue = nil
+	crawler.hybridVisited = nil
+	crawler.hybridAPISet = nil
+	crawler.stateGraph = nil
+	crawler.hybridEnabled = false
+	crawler.hybridCancel = nil
+	crawler.hybridCtx = nil
 }
