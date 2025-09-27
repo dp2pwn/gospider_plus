@@ -80,6 +80,10 @@ func NormalizeURL(base *url.URL, candidate string) (string, bool) {
 	}
 	resolved.Path = cleanedPath
 
+	if hasRecursiveQuery(resolved) {
+		return "", false
+	}
+
 	if shouldExclude(resolved) {
 		return "", false
 	}
@@ -202,6 +206,45 @@ func equalSegmentSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func hasRecursiveQuery(u *url.URL) bool {
+	if u == nil || u.RawQuery == "" {
+		return false
+	}
+
+	if len(u.RawQuery) > 4096 {
+		return true
+	}
+
+	const repeatThreshold = 3
+
+	hostLower := strings.ToLower(u.Hostname())
+	rawLower := strings.ToLower(u.RawQuery)
+	if hostLower != "" && strings.Count(rawLower, hostLower) >= repeatThreshold {
+		return true
+	}
+
+	encodedHTTPCount := strings.Count(rawLower, "http%3a%2f%2f") + strings.Count(rawLower, "https%3a%2f%2f")
+	if encodedHTTPCount >= repeatThreshold {
+		return true
+	}
+
+	decoded, err := url.QueryUnescape(u.RawQuery)
+	if err == nil {
+		decodedLower := strings.ToLower(decoded)
+		if hostLower != "" && strings.Count(decodedLower, hostLower) >= repeatThreshold {
+			return true
+		}
+		if strings.Count(decodedLower, "http://") >= repeatThreshold || strings.Count(decodedLower, "https://") >= repeatThreshold {
+			return true
+		}
+		if strings.Count(decodedLower, "404;") >= repeatThreshold {
+			return true
+		}
+	}
+
+	return false
 }
 
 func shouldExclude(u *url.URL) bool {
