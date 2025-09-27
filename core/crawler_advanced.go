@@ -44,6 +44,7 @@ type reflectionEntry struct {
 	mutatedMarkers     []string
 	emitted            bool
 	mutationsScheduled int
+	mutatedParams      map[string]struct{}
 }
 
 type reflectionFinding struct {
@@ -61,6 +62,37 @@ type reflectionMutation struct {
 	Request JSRequest
 	Param   string
 	Payload string
+}
+
+func (entry *reflectionEntry) prepareMutations(limit int, mutations []reflectionMutation) []reflectionMutation {
+	if limit <= entry.mutationsScheduled || len(mutations) == 0 {
+		return nil
+	}
+	remaining := limit - entry.mutationsScheduled
+	if remaining <= 0 {
+		return nil
+	}
+	if entry.mutatedParams == nil {
+		entry.mutatedParams = make(map[string]struct{})
+	}
+	filtered := make([]reflectionMutation, 0, len(mutations))
+	for _, mutation := range mutations {
+		key := strings.ToLower(strings.TrimSpace(mutation.Param))
+		if key == "" {
+			key = reflectedParamName
+		}
+		if _, exists := entry.mutatedParams[key]; exists {
+			continue
+		}
+		entry.mutatedParams[key] = struct{}{}
+		filtered = append(filtered, mutation)
+		remaining--
+		if remaining == 0 {
+			break
+		}
+	}
+	entry.mutationsScheduled += len(filtered)
+	return filtered
 }
 
 func (crawler *Crawler) processGeneratedRequest(req JSRequest, origin string, parentDepth int) {
@@ -179,8 +211,15 @@ func (crawler *Crawler) scheduleJSRequest(req JSRequest, origin string, parentDe
 
 	crawler.reflectedMutex.Lock()
 	entry = crawler.ensureReflectionEntry(key)
-	entry.mutationsScheduled += len(mutations)
+	if entry.emitted {
+		crawler.reflectedMutex.Unlock()
+		return
+	}
+	mutations = entry.prepareMutations(budget, mutations)
 	crawler.reflectedMutex.Unlock()
+	if len(mutations) == 0 {
+		return
+	}
 	for _, mutation := range mutations {
 		crawler.queueRequest(mutation.Request, origin, aggressive, key, parentDepth, mutation.Param, mutation.Payload)
 	}
