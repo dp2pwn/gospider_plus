@@ -74,7 +74,11 @@ func NormalizeURL(base *url.URL, candidate string) (string, bool) {
 
 	// Normalise path and drop fragments.
 	resolved.Fragment = ""
-	resolved.Path = cleanPath(resolved.Path)
+	cleanedPath, ok := cleanPath(resolved.Path)
+	if !ok {
+		return "", false
+	}
+	resolved.Path = cleanedPath
 
 	if shouldExclude(resolved) {
 		return "", false
@@ -83,16 +87,121 @@ func NormalizeURL(base *url.URL, candidate string) (string, bool) {
 	return resolved.String(), true
 }
 
-func cleanPath(p string) string {
+func cleanPath(p string) (string, bool) {
 	p = strings.TrimSpace(p)
 	if p == "" {
-		return "/"
+		return "/", true
 	}
-	// Collapse duplicate slashes.
+
+	// Normalise slashes and separators.
+	p = strings.ReplaceAll(p, "\\", "/")
 	for strings.Contains(p, "//") {
 		p = strings.ReplaceAll(p, "//", "/")
 	}
-	return p
+
+	trailingSlash := strings.HasSuffix(p, "/")
+	trimmed := strings.Trim(p, "/")
+	if trimmed == "" {
+		return "/", true
+	}
+
+	parts := strings.Split(trimmed, "/")
+	segments := make([]string, 0, len(parts))
+	for _, part := range parts {
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			if len(segments) > 0 {
+				segments = segments[:len(segments)-1]
+			}
+		default:
+			segments = append(segments, part)
+		}
+	}
+
+	if len(segments) == 0 {
+		return "/", true
+	}
+
+	if hasPathLoops(segments) {
+		return "", false
+	}
+
+	normalized := "/" + strings.Join(segments, "/")
+	if len(normalized) > 2048 {
+		return "", false
+	}
+	if trailingSlash && normalized != "/" {
+		normalized += "/"
+	}
+	return normalized, true
+}
+
+func hasPathLoops(segments []string) bool {
+	if len(segments) > 128 {
+		return true
+	}
+
+	lower := make([]string, len(segments))
+	for i, seg := range segments {
+		lower[i] = strings.ToLower(seg)
+	}
+
+	const maxRepeat = 3
+	repeat := 1
+	for i := 1; i < len(lower); i++ {
+		if lower[i] == lower[i-1] {
+			repeat++
+			if repeat >= maxRepeat {
+				return true
+			}
+		} else {
+			repeat = 1
+		}
+	}
+
+	const cycleThreshold = 3
+	for cycleLen := 2; cycleLen <= 4 && cycleLen*cycleThreshold <= len(lower); cycleLen++ {
+		if hasRepeatedCycle(lower, cycleLen, cycleThreshold) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func hasRepeatedCycle(segments []string, cycleLen, threshold int) bool {
+	limit := len(segments) - cycleLen*threshold
+	if limit < 0 {
+		return false
+	}
+	for start := 0; start <= len(segments)-cycleLen*threshold; start++ {
+		repeats := 1
+		for pos := start + cycleLen; pos+cycleLen <= len(segments); pos += cycleLen {
+			if equalSegmentSlices(segments[start:start+cycleLen], segments[pos:pos+cycleLen]) {
+				repeats++
+				if repeats >= threshold {
+					return true
+				}
+			} else {
+				break
+			}
+		}
+	}
+	return false
+}
+
+func equalSegmentSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func shouldExclude(u *url.URL) bool {
