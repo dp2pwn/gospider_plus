@@ -18,29 +18,32 @@ import (
 	jsoniter "github.com/json-iterator/go"
 )
 
-const defaultReflectedPayload = "__gospider_reflected__"
-
-const reflectedParamName = "gospider_ref"
+const (
+	defaultReflectedPayload     = "__gospider_reflected__"
+	reflectedParamName          = "gospider_ref"
+	defaultReflectedMutationCap = 16
+)
 
 var templateMarkerRegex = regexp.MustCompile(`(?i)\[object [^\]]+\]([0-9]+)\[object [^\]]+\]`)
 
 type reflectionEntry struct {
-	baselineSet     bool
-	mutatedSet      bool
-	baselineHash    string
-	mutatedHash     string
-	baselineStatus  int
-	mutatedStatus   int
-	baselineLen     int
-	mutatedLen      int
-	mutatedContains bool
-	url             string
-	method          string
-	origin          string
-	param           string
-	payload         string
-	mutatedMarkers  []string
-	emitted         bool
+	baselineSet        bool
+	mutatedSet         bool
+	baselineHash       string
+	mutatedHash        string
+	baselineStatus     int
+	mutatedStatus      int
+	baselineLen        int
+	mutatedLen         int
+	mutatedContains    bool
+	url                string
+	method             string
+	origin             string
+	param              string
+	payload            string
+	mutatedMarkers     []string
+	emitted            bool
+	mutationsScheduled int
 }
 
 type reflectionFinding struct {
@@ -124,19 +127,60 @@ func (crawler *Crawler) normalizeJSRequest(req JSRequest, origin string) (JSRequ
 	return normalized, true
 }
 
+func (crawler *Crawler) mutationBudget(aggressive bool) int {
+	cap := crawler.baselineFuzzCap
+	if cap <= 0 {
+		cap = 2
+	}
+	if !aggressive {
+		return cap
+	}
+	scaled := cap * 4
+	if scaled < cap {
+		scaled = cap
+	}
+	if scaled < 8 {
+		scaled = 8
+	}
+	if scaled > defaultReflectedMutationCap {
+		scaled = defaultReflectedMutationCap
+	}
+	return scaled
+}
+
 func (crawler *Crawler) scheduleJSRequest(req JSRequest, origin string, parentDepth int) {
 	key := buildRequestKey(req)
 	crawler.queueRequest(req, origin, false, key, parentDepth, "", "")
 
-	budget := crawler.baselineFuzzCap
 	aggressive := crawler.reflected
-	if aggressive {
-		budget = len(crawler.payloadVariants)
-	}
-	if budget == 0 {
+	budget := crawler.mutationBudget(aggressive)
+	if budget <= 0 {
 		return
 	}
-	mutations := crawler.buildReflectedRequests(req, aggressive, budget)
+
+	crawler.reflectedMutex.Lock()
+	entry := crawler.ensureReflectionEntry(key)
+	if entry.emitted {
+		crawler.reflectedMutex.Unlock()
+		return
+	}
+	alreadyScheduled := entry.mutationsScheduled
+	if alreadyScheduled >= budget {
+		crawler.reflectedMutex.Unlock()
+		return
+	}
+	remaining := budget - alreadyScheduled
+	crawler.reflectedMutex.Unlock()
+
+	mutations := crawler.buildReflectedRequests(req, aggressive, remaining)
+	if len(mutations) == 0 {
+		return
+	}
+
+	crawler.reflectedMutex.Lock()
+	entry = crawler.ensureReflectionEntry(key)
+	entry.mutationsScheduled += len(mutations)
+	crawler.reflectedMutex.Unlock()
 	for _, mutation := range mutations {
 		crawler.queueRequest(mutation.Request, origin, aggressive, key, parentDepth, mutation.Param, mutation.Payload)
 	}
@@ -199,6 +243,10 @@ func (crawler *Crawler) queueRequest(req JSRequest, origin string, reflected boo
 		crawler.reflectedMutex.Lock()
 		entry := crawler.ensureReflectionEntry(baselineKey)
 		if reflected {
+			if entry.emitted {
+				crawler.reflectedMutex.Unlock()
+				return
+			}
 			if paramName == "" {
 				paramName = reflectedParamName
 			}
