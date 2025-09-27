@@ -58,6 +58,131 @@ type reflectionFinding struct {
 	Reasons []string
 }
 
+const reflectionPayloadPlaceholder = "__payload__"
+
+func containsSentinelFragment(value, payload string) bool {
+	if value == "" {
+		return false
+	}
+	lower := strings.ToLower(value)
+	if strings.Contains(lower, "__gospider_reflected__") {
+		return true
+	}
+	if payload != "" && strings.Contains(lower, strings.ToLower(payload)) {
+		return true
+	}
+	decoded, err := url.QueryUnescape(value)
+	if err == nil && decoded != value {
+		if containsSentinelFragment(decoded, payload) {
+			return true
+		}
+	}
+	return false
+}
+
+func replacePayloadTokens(value, payload string) string {
+	if value == "" {
+		return value
+	}
+	if containsSentinelFragment(value, payload) {
+		return reflectionPayloadPlaceholder
+	}
+	return value
+}
+
+func canonicalizeRawURL(rawURL, payload string) string {
+	if rawURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return replacePayloadTokens(rawURL, payload)
+	}
+	changed := false
+
+	if containsSentinelFragment(parsed.Path, payload) {
+		parsed.Path = reflectionPayloadPlaceholder
+		changed = true
+	}
+	query := parsed.Query()
+	for key, vals := range query {
+		for i, v := range vals {
+			nv := replacePayloadTokens(v, payload)
+			if nv != v {
+				vals[i] = nv
+				changed = true
+			}
+		}
+		query[key] = vals
+	}
+	if changed {
+		parsed.RawQuery = query.Encode()
+	}
+
+	if parsed.Fragment != "" {
+		if containsSentinelFragment(parsed.Fragment, payload) {
+			parsed.Fragment = reflectionPayloadPlaceholder
+			changed = true
+		}
+	}
+
+	if changed {
+		return parsed.String()
+	}
+	return replacePayloadTokens(rawURL, payload)
+}
+
+func canonicalizeBody(body, payload string) string {
+	trimmed := strings.TrimSpace(body)
+	if trimmed == "" {
+		return ""
+	}
+	if vals, err := url.ParseQuery(trimmed); err == nil && len(vals) > 0 {
+		changed := false
+		for key, list := range vals {
+			for i, v := range list {
+				nv := replacePayloadTokens(v, payload)
+				if nv != v {
+					list[i] = nv
+					changed = true
+				}
+			}
+			vals[key] = list
+		}
+		if changed {
+			return vals.Encode()
+		}
+	}
+	return replacePayloadTokens(trimmed, payload)
+}
+
+func canonicalReflectionKey(method, rawURL, body, payload string) string {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	if method == "" {
+		method = http.MethodGet
+	}
+	canonicalURL := canonicalizeRawURL(strings.TrimSpace(rawURL), payload)
+	canonicalBody := canonicalizeBody(body, payload)
+	return method + " " + canonicalURL + " " + canonicalBody
+}
+
+func requestHasSentinel(req JSRequest, payload string) bool {
+	if containsSentinelFragment(req.RawURL, payload) {
+		return true
+	}
+	if containsSentinelFragment(req.Body, payload) {
+		return true
+	}
+	if len(req.Headers) > 0 {
+		for _, v := range req.Headers {
+			if containsSentinelFragment(v, payload) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 type reflectionMutation struct {
 	Request JSRequest
 	Param   string
@@ -181,7 +306,10 @@ func (crawler *Crawler) mutationBudget(aggressive bool) int {
 }
 
 func (crawler *Crawler) scheduleJSRequest(req JSRequest, origin string, parentDepth int) {
-	key := buildRequestKey(req)
+	if requestHasSentinel(req, crawler.reflectedPayload) {
+		return
+	}
+	key := canonicalReflectionKey(req.Method, req.RawURL, req.Body, crawler.reflectedPayload)
 	crawler.queueRequest(req, origin, false, key, parentDepth, "", "")
 
 	aggressive := crawler.reflected
