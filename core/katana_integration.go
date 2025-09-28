@@ -65,7 +65,8 @@ func (crawler *Crawler) DeepCrawlWithKatana(cfg CrawlerConfig) error {
 			options.RateLimitMinute = options.RateLimit * multiplier
 		}
 		if options.CrawlDuration == 0 {
-			options.CrawlDuration = 30 * time.Minute
+			// Increased default duration slightly for ultra intensity
+			options.CrawlDuration = 45 * time.Minute
 		} else {
 			options.CrawlDuration *= time.Duration(multiplier)
 		}
@@ -114,11 +115,20 @@ func (crawler *Crawler) DeepCrawlWithKatana(cfg CrawlerConfig) error {
 	}
 
 	options.OnResult = func(res katanaOutput.Result) {
+		// Check if crawler has been stopped
+		if crawler.stopped.Load() {
+			// Katana doesn't have an explicit Stop() method exposed easily here.
+			// We rely on the OnResult callback returning quickly.
+			return
+		}
 		crawler.handleKatanaResult(res)
 	}
 
 	crawlerOptions, err := types.NewCrawlerOptions(&options)
 	if err != nil {
+		if crawler.Stats != nil {
+			crawler.Stats.IncrementErrors()
+		}
 		return err
 	}
 	defer crawlerOptions.Close()
@@ -134,24 +144,31 @@ func (crawler *Crawler) DeepCrawlWithKatana(cfg CrawlerConfig) error {
 
 	katanaCrawler, err := standard.New(crawlerOptions)
 	if err != nil {
+		if crawler.Stats != nil {
+			crawler.Stats.IncrementErrors()
+		}
 		return err
 	}
 	defer katanaCrawler.Close()
 
+	// Note: Katana's Crawl method blocks until finished. If the crawler.stopped flag is set,
+	// the OnResult callbacks will stop processing, but the underlying Katana engine might
+	// continue running until its internal queue is empty or duration is reached.
 	return katanaCrawler.Crawl(crawler.Input)
 }
 
 func resolveKatanaDepth(depth int, intensity ExtractorIntensity) int {
 	if depth <= 0 {
-		depth = 25
+		// If depth is 0 (infinite in gospider), set a practical high limit for Katana
+		depth = 50
 	}
 	if intensity == IntensityUltra {
 		if depth < 25 {
 			depth = 25
 		}
-		depth *= 10
-		if depth < 100 {
-			depth = 100
+		depth *= 5
+		if depth > 200 {
+			depth = 200 // Capping depth
 		}
 	}
 	return depth
@@ -234,6 +251,10 @@ func (f *filterAdapter) IsCycle(u string) bool {
 }
 
 func (crawler *Crawler) handleKatanaResult(res katanaOutput.Result) {
+	if crawler.Stats != nil {
+		crawler.Stats.IncrementRequestsMade() // Katana makes the request internally
+	}
+
 	method := ""
 	body := ""
 	target := ""
@@ -252,6 +273,11 @@ func (crawler *Crawler) handleKatanaResult(res katanaOutput.Result) {
 	if crawler.isDuplicateRequest(method, target, body) {
 		return
 	}
+
+	if crawler.Stats != nil {
+		crawler.Stats.IncrementURLsFound()
+	}
+
 	method = strings.ToUpper(strings.TrimSpace(method))
 	if method == "" {
 		method = http.MethodGet
@@ -266,6 +292,12 @@ func (crawler *Crawler) handleKatanaResult(res katanaOutput.Result) {
 			length = len(res.Response.Body)
 		}
 	}
+
+	// Check for errors reported by Katana
+	if res.Error != "" && crawler.Stats != nil {
+		crawler.Stats.IncrementErrors()
+	}
+
 	if method == http.MethodPost && status > 0 {
 		Logger.Infof("[post-hit] %s %s (%d)", method, target, status)
 	}

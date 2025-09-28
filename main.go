@@ -2,12 +2,16 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io/ioutil"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	jsoniter "github.com/json-iterator/go"
 
@@ -110,6 +114,42 @@ func run(cmd *cobra.Command, _ []string) {
 		}
 	}
 
+	// Setup context and signal handling
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Initialize Statistics
+	stats := core.NewCrawlStats()
+	startTime := time.Now()
+	quiet, _ := cmd.Flags().GetBool("quiet")
+
+	// Goroutine for signal handling and stats reporting
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case sig := <-sigChan:
+				core.Logger.Warnf("Received signal %s, shutting down...", sig)
+				cancel() // Signal cancellation to stop workers and stats printing
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Print stats periodically if not quiet
+				if !quiet {
+					elapsed := time.Since(startTime).Round(time.Second)
+					core.Logger.Infof("Stats [%s]: URLs: %d, Requests: %d, Errors: %d, RPS: %.2f",
+						elapsed, stats.GetURLsFound(), stats.GetRequestsMade(), stats.GetErrors(), stats.GetRPS(elapsed))
+				}
+			}
+		}
+	}()
+
 	// Parse sites input
 	var siteList []string
 	siteInput, _ := cmd.Flags().GetString("site")
@@ -162,22 +202,64 @@ func run(cmd *cobra.Command, _ []string) {
 	}
 
 	crawlerConfig := core.NewCrawlerConfig(cmd)
+
 	var wg sync.WaitGroup
 	inputChan := make(chan string, threads)
+
+	// Use a map to track active crawlers for explicit stopping
+	activeCrawlers := make(map[*core.Crawler]struct{})
+	var crawlerMutex sync.Mutex
+
+	// Goroutine to handle cancellation and explicitly stop crawlers
+	go func() {
+		<-ctx.Done()
+		// Wait a moment for things to start winding down naturally
+		time.Sleep(500 * time.Millisecond)
+
+		crawlerMutex.Lock()
+		if len(activeCrawlers) > 0 {
+			core.Logger.Warn("Forcing stop on active crawlers...")
+		}
+		for crawler := range activeCrawlers {
+			crawler.Stop()
+		}
+		crawlerMutex.Unlock()
+	}()
+
 	for i := 0; i < threads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for rawSite := range inputChan {
+				// Check if context is cancelled before processing
+				if ctx.Err() != nil {
+					return
+				}
+
 				site, err := url.Parse(rawSite)
 				if err != nil {
 					logrus.Errorf("Failed to parse %s: %s", rawSite, err)
+					stats.IncrementErrors()
 					continue
 				}
 
 				var siteWg sync.WaitGroup
 
 				crawler := core.NewCrawler(site, crawlerConfig)
+				crawler.Stats = stats // Assign the global stats object
+
+				// Register crawler
+				crawlerMutex.Lock()
+				activeCrawlers[crawler] = struct{}{}
+				crawlerMutex.Unlock()
+
+				// Ensure crawler is unregistered when done
+				defer func() {
+					crawlerMutex.Lock()
+					delete(activeCrawlers, crawler)
+					crawlerMutex.Unlock()
+				}()
+
 				siteWg.Add(1)
 				go func() {
 					defer siteWg.Done()
@@ -207,6 +289,7 @@ func run(cmd *cobra.Command, _ []string) {
 					go func() {
 						defer siteWg.Done()
 						urls := core.OtherSources(site.Hostname(), includeSubs)
+						stats.AddURLsFound(len(urls))
 						for _, url := range urls {
 							url = strings.TrimSpace(url)
 							if len(url) == 0 {
@@ -235,6 +318,11 @@ func run(cmd *cobra.Command, _ []string) {
 								}
 							}
 
+							// Check context/stop signal before visiting
+							// Use the exported IsStopped() method
+							if ctx.Err() != nil || crawler.IsStopped() {
+								return
+							}
 							_ = crawler.C.Visit(url)
 						}
 					}()
@@ -247,11 +335,31 @@ func run(cmd *cobra.Command, _ []string) {
 		}()
 	}
 
-	for _, site := range siteList {
-		inputChan <- site
-	}
-	close(inputChan)
+	// Feed sites into the channel, respecting context cancellation
+	go func() {
+		defer close(inputChan)
+		for _, site := range siteList {
+			select {
+			case <-ctx.Done():
+				core.Logger.Warn("Stopping site input due to cancellation.")
+				return
+			case inputChan <- site:
+			}
+		}
+	}()
+
 	wg.Wait()
+
+	// Ensure the stats/signal goroutine stops if it hasn't already
+	cancel()
+
+	// Final stats report
+	elapsed := time.Since(startTime).Round(time.Second)
+	if !quiet {
+		core.Logger.Infof("Crawl finished in %s", elapsed)
+		core.Logger.Infof("Final Stats: URLs Found: %d, Requests Made: %d, Errors: %d, Average RPS: %.2f",
+			stats.GetURLsFound(), stats.GetRequestsMade(), stats.GetErrors(), stats.GetRPS(elapsed))
+	}
 	core.Logger.Info("Done.")
 }
 

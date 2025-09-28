@@ -28,6 +28,7 @@ type Crawler struct {
 	LinkFinderCollector *colly.Collector
 	Output              *Output
 	AntiDetectClient    *antidetect.AntiDetectClient
+	Stats               *CrawlStats
 
 	subSet       *stringset.StringFilter
 	awsSet       *stringset.StringFilter
@@ -82,6 +83,10 @@ type Crawler struct {
 	hybridActive   atomic.Bool
 	hybridVisitCap int
 	hybridEnqueued int64
+
+	// Fields for stopping the crawler
+	stopChan chan struct{}
+	stopped  atomic.Bool
 }
 
 type SpiderOutput struct {
@@ -95,6 +100,34 @@ type SpiderOutput struct {
 	Payload    string `json:"payload,omitempty"`
 	Confidence string `json:"confidence,omitempty"`
 	Snippet    string `json:"snippet,omitempty"`
+}
+
+// IsStopped returns true if the crawler has been signaled to stop.
+func (crawler *Crawler) IsStopped() bool {
+	return crawler.stopped.Load()
+}
+
+// Stop gracefully stops the crawler
+func (crawler *Crawler) Stop() {
+	if crawler.stopped.Load() {
+		return
+	}
+	crawler.stopped.Store(true)
+	Logger.Warnf("Stopping crawler for %s...", crawler.site)
+
+	// Stop hybrid crawling if active
+	crawler.stopHybrid()
+
+	// Signal the stop channel
+	select {
+	case <-crawler.stopChan:
+		// Already closed
+	default:
+		close(crawler.stopChan)
+	}
+
+	// Wait for ongoing activities to wind down (best effort)
+	// Colly's Wait() will return faster because OnRequest callbacks will abort new requests.
 }
 
 func (crawler *Crawler) isDuplicateURL(raw string) bool {
@@ -370,13 +403,7 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 	sRegex := regexp.MustCompile(reg)
 	c.URLFilters = append(c.URLFilters, sRegex)
 
-	c.OnRequest(func(r *colly.Request) {
-		if depthStr := r.Ctx.Get("__depth"); depthStr != "" {
-			if depth, err := strconv.Atoi(depthStr); err == nil {
-				r.Depth = depth
-			}
-		}
-	})
+	// The original OnRequest handler for depth is removed here because it will be replaced later.
 
 	if err := c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
@@ -459,7 +486,35 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 		baselinePayloads:    baselinePayloads,
 		payloadRNG:          rng,
 		domAnalyzer:         NewDOMAnalyzer(),
+		stopChan:            make(chan struct{}),
 	}
+
+	// Add OnRequest handlers NOW, after crawler is initialized
+	crawler.C.OnRequest(func(r *colly.Request) {
+		if crawler.stopped.Load() {
+			r.Abort()
+			return
+		}
+		if depthStr := r.Ctx.Get("__depth"); depthStr != "" {
+			if depth, err := strconv.Atoi(depthStr); err == nil {
+				r.Depth = depth
+			}
+		}
+		if crawler.Stats != nil {
+			crawler.Stats.IncrementRequestsMade()
+		}
+	})
+
+	crawler.LinkFinderCollector.OnRequest(func(r *colly.Request) {
+		if crawler.stopped.Load() {
+			r.Abort()
+			return
+		}
+		if crawler.Stats != nil {
+			crawler.Stats.IncrementRequestsMade()
+		}
+	})
+
 	crawler.initializeHybrid(cfg)
 	return crawler
 }
@@ -467,6 +522,9 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 func (crawler *Crawler) feedLinkfinder(jsFileUrl string, OutputType string, source string) {
 
 	if !crawler.jsSet.Duplicate(jsFileUrl) {
+		if crawler.Stats != nil {
+			crawler.Stats.IncrementURLsFound()
+		}
 		outputFormat := fmt.Sprintf("[%s] - %s", OutputType, jsFileUrl)
 
 		if crawler.JsonOutput {
@@ -563,6 +621,9 @@ func (crawler *Crawler) Start(linkfinder bool) {
 
 	// Handle url
 	crawler.C.OnHTML("[href]", func(e *colly.HTMLElement) {
+		if crawler.stopped.Load() {
+			return
+		}
 		if crawler.shouldSkipDOM(e.Request.URL.String()) {
 			return
 		}
@@ -575,6 +636,9 @@ func (crawler *Crawler) Start(linkfinder bool) {
 			}
 		}
 		if !crawler.isDuplicateURL(urlString) {
+			if crawler.Stats != nil {
+				crawler.Stats.IncrementURLsFound()
+			}
 			outputFormat := fmt.Sprintf("[href] - %s", urlString)
 			if crawler.JsonOutput {
 				sout := SpiderOutput{
@@ -599,11 +663,17 @@ func (crawler *Crawler) Start(linkfinder bool) {
 
 	// Handle form
 	crawler.C.OnHTML("form", func(e *colly.HTMLElement) {
+		if crawler.stopped.Load() {
+			return
+		}
 		if crawler.shouldSkipDOM(e.Request.URL.String()) {
 			return
 		}
 		formURL := e.Request.URL.String()
 		if !crawler.formSet.Duplicate(formURL) {
+			if crawler.Stats != nil {
+				crawler.Stats.IncrementURLsFound()
+			}
 			outputFormat := fmt.Sprintf("[form] - %s", formURL)
 			if crawler.JsonOutput {
 				sout := SpiderOutput{
@@ -625,6 +695,9 @@ func (crawler *Crawler) Start(linkfinder bool) {
 		}
 
 		requests := ExtractFormRequests(e.DOM, e.Request.URL)
+		if crawler.Stats != nil {
+			crawler.Stats.AddURLsFound(len(requests))
+		}
 		for _, req := range requests {
 			req.Source = formURL
 			crawler.processGeneratedRequest(req, formURL, e.Request.Depth)
@@ -634,6 +707,9 @@ func (crawler *Crawler) Start(linkfinder bool) {
 	// Find Upload Form
 	uploadFormSet := stringset.NewStringFilter()
 	crawler.C.OnHTML(`input[type="file"]`, func(e *colly.HTMLElement) {
+		if crawler.stopped.Load() {
+			return
+		}
 		if crawler.shouldSkipDOM(e.Request.URL.String()) {
 			return
 		}
@@ -663,6 +739,9 @@ func (crawler *Crawler) Start(linkfinder bool) {
 
 	// Handle js files
 	crawler.C.OnHTML("[src]", func(e *colly.HTMLElement) {
+		if crawler.stopped.Load() {
+			return
+		}
 		if crawler.shouldSkipDOM(e.Request.URL.String()) {
 			return
 		}
@@ -681,6 +760,9 @@ func (crawler *Crawler) Start(linkfinder bool) {
 	})
 
 	crawler.C.OnResponse(func(response *colly.Response) {
+		if crawler.stopped.Load() {
+			return
+		}
 		if response.Ctx != nil && response.Ctx.Get("reflected") == "true" {
 			crawler.handleReflectedResponse(response)
 			return
@@ -783,6 +865,9 @@ func (crawler *Crawler) Start(linkfinder bool) {
 	})
 
 	crawler.C.OnError(func(response *colly.Response, err error) {
+		if crawler.Stats != nil {
+			crawler.Stats.IncrementErrors()
+		}
 		Logger.Debugf("Error request: %s - Status code: %v - Error: %s", response.Request.URL.String(), response.StatusCode, err)
 		crawler.recordBackoff(response.StatusCode)
 		/*
@@ -829,6 +914,9 @@ func (crawler *Crawler) Start(linkfinder bool) {
 	err := crawler.C.Visit(crawler.site.String())
 	if err != nil {
 		Logger.Errorf("Failed to start %s: %s", crawler.site.String(), err)
+		if crawler.Stats != nil {
+			crawler.Stats.IncrementErrors()
+		}
 	}
 }
 
@@ -848,6 +936,10 @@ func (crawler *Crawler) bootstrapSubdomains() {
 			crawler.subSet = stringset.NewStringFilter()
 		}
 		_ = crawler.subSet.Duplicate(sub)
+
+		if crawler.Stats != nil {
+			crawler.Stats.IncrementURLsFound()
+		}
 
 		logLine := "[subdomains] - " + sub
 		if crawler.JsonOutput {
@@ -889,6 +981,9 @@ func (crawler *Crawler) findSubdomains(resp string) {
 	subs := GetSubdomains(resp, crawler.domain)
 	for _, sub := range subs {
 		if !crawler.subSet.Duplicate(sub) {
+			if crawler.Stats != nil {
+				crawler.Stats.IncrementURLsFound()
+			}
 			outputFormat := fmt.Sprintf("[subdomains] - %s", sub)
 
 			if crawler.JsonOutput {
@@ -960,6 +1055,9 @@ func (crawler *Crawler) findAWSS3(resp string) {
 	aws := GetAWSS3(resp)
 	for _, e := range aws {
 		if !crawler.awsSet.Duplicate(e) {
+			if crawler.Stats != nil {
+				crawler.Stats.IncrementURLsFound()
+			}
 			outputFormat := fmt.Sprintf("[aws-s3] - %s", e)
 			if crawler.JsonOutput {
 				sout := SpiderOutput{
@@ -983,6 +1081,9 @@ func (crawler *Crawler) findAWSS3(resp string) {
 // Setup link finder
 func (crawler *Crawler) setupLinkFinder() {
 	crawler.LinkFinderCollector.OnResponse(func(response *colly.Response) {
+		if crawler.stopped.Load() {
+			return
+		}
 		if response.Ctx != nil && response.Ctx.Get("reflected") == "true" {
 			crawler.handleReflectedResponse(response)
 			return
@@ -1036,7 +1137,15 @@ func (crawler *Crawler) setupLinkFinder() {
 				paths, jsRequests, err := LinkFinder(respStr, response.Request.URL)
 				if err != nil {
 					Logger.Error(err)
+					if crawler.Stats != nil {
+						crawler.Stats.IncrementErrors()
+					}
 					return
+				}
+
+				if crawler.Stats != nil {
+					crawler.Stats.AddURLsFound(len(paths))
+					crawler.Stats.AddURLsFound(len(jsRequests))
 				}
 
 				currentBase := crawler.site
@@ -1220,6 +1329,9 @@ func (crawler *Crawler) initializeHybrid(cfg CrawlerConfig) {
 		crawler.hybridActive.Store(false)
 		crawler.hybridCancel()
 		Logger.Errorf("hybrid mode disabled: %v", err)
+		if crawler.Stats != nil {
+			crawler.Stats.IncrementErrors()
+		}
 		crawler.browserPool = nil
 		crawler.stateGraph = nil
 		crawler.hybridQueue = nil
@@ -1249,8 +1361,13 @@ func (crawler *Crawler) hybridWorker() {
 	}
 
 	for {
+		if crawler.stopped.Load() {
+			return
+		}
 		select {
 		case <-crawler.hybridCtx.Done():
+			return
+		case <-crawler.stopChan:
 			return
 		case url := <-crawler.hybridQueue:
 			if !crawler.hybridActive.Load() || url == "" {
@@ -1259,9 +1376,15 @@ func (crawler *Crawler) hybridWorker() {
 			if crawler.browserPool == nil || crawler.stateGraph == nil {
 				continue
 			}
+			if crawler.Stats != nil {
+				crawler.Stats.IncrementRequestsMade()
+			}
 			result, err := crawler.browserPool.NavigateAndAnalyze(crawler.hybridCtx, url, crawler.stateGraph)
 			if err != nil {
 				Logger.Debugf("hybrid analyze failed for %s: %v", url, err)
+				if crawler.Stats != nil {
+					crawler.Stats.IncrementErrors()
+				}
 				continue
 			}
 			crawler.handleHybridResult(result)
@@ -1285,6 +1408,8 @@ func (crawler *Crawler) enqueueHybrid(raw string) {
 	select {
 	case <-crawler.hybridCtx.Done():
 		return
+	case <-crawler.stopChan:
+		return
 	case crawler.hybridQueue <- raw:
 	default:
 		Logger.Debugf("hybrid queue saturated, dropping %s", raw)
@@ -1296,10 +1421,21 @@ func (crawler *Crawler) handleHybridResult(result *PageAnalysisResult) {
 		return
 	}
 
+	if crawler.Stats != nil {
+		crawler.Stats.IncrementURLsFound() // Count the analyzed page itself
+	}
+
 	crawler.stateGraph.MarkAnalyzed(result.StateHash)
 
 	if len(result.APICalls) > 0 {
+		if crawler.Stats != nil {
+			crawler.Stats.AddURLsFound(len(result.APICalls))
+		}
 		crawler.emitHybridAPICalls(result.URL, result.APICalls)
+	}
+
+	if crawler.Stats != nil {
+		crawler.Stats.AddURLsFound(len(result.Transitions))
 	}
 
 	for _, tr := range result.Transitions {
