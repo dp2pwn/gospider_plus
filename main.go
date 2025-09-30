@@ -106,7 +106,6 @@ func run(cmd *cobra.Command, _ []string) {
 		core.Logger.SetOutput(ioutil.Discard)
 	}
 
-	// Create output folder when save file option selected
 	outputFolder, _ := cmd.Flags().GetString("output")
 	if outputFolder != "" {
 		if _, err := os.Stat(outputFolder); os.IsNotExist(err) {
@@ -114,19 +113,16 @@ func run(cmd *cobra.Command, _ []string) {
 		}
 	}
 
-	// Setup context and signal handling
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Initialize Statistics
 	stats := core.NewCrawlStats()
 	startTime := time.Now()
 	quiet, _ := cmd.Flags().GetBool("quiet")
 
-	// Goroutine for signal handling and stats reporting
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
@@ -135,12 +131,11 @@ func run(cmd *cobra.Command, _ []string) {
 			select {
 			case sig := <-sigChan:
 				core.Logger.Warnf("Received signal %s, shutting down...", sig)
-				cancel() // Signal cancellation to stop workers and stats printing
+				cancel()
 				return
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				// Print stats periodically if not quiet
 				if !quiet {
 					elapsed := time.Since(startTime).Round(time.Second)
 					core.Logger.Infof("Stats [%s]: URLs: %d, Requests: %d, Errors: %d, RPS: %.2f",
@@ -150,7 +145,6 @@ func run(cmd *cobra.Command, _ []string) {
 		}
 	}()
 
-	// Parse sites input
 	var siteList []string
 	siteInput, _ := cmd.Flags().GetString("site")
 	if siteInput != "" {
@@ -158,7 +152,6 @@ func run(cmd *cobra.Command, _ []string) {
 	}
 	sitesListInput, _ := cmd.Flags().GetString("sites")
 	if sitesListInput != "" {
-		// parse from stdin
 		sitesFile := core.ReadingLines(sitesListInput)
 		if len(sitesFile) > 0 {
 			siteList = append(siteList, sitesFile...)
@@ -166,7 +159,6 @@ func run(cmd *cobra.Command, _ []string) {
 	}
 
 	stat, _ := os.Stdin.Stat()
-	// detect if anything came from std
 	if (stat.Mode() & os.ModeCharDevice) == 0 {
 		sc := bufio.NewScanner(os.Stdin)
 		for sc.Scan() {
@@ -177,7 +169,6 @@ func run(cmd *cobra.Command, _ []string) {
 		}
 	}
 
-	// Check again to make sure at least one site in slice
 	if len(siteList) == 0 {
 		core.Logger.Info("No site in list. Please check your site input again")
 		os.Exit(1)
@@ -191,7 +182,6 @@ func run(cmd *cobra.Command, _ []string) {
 	includeSubs, _ := cmd.Flags().GetBool("include-subs")
 	includeOtherSourceResult, _ := cmd.Flags().GetBool("include-other-source")
 
-	// disable all options above
 	base, _ := cmd.Flags().GetBool("base")
 	if base {
 		linkfinder = false
@@ -206,14 +196,11 @@ func run(cmd *cobra.Command, _ []string) {
 	var wg sync.WaitGroup
 	inputChan := make(chan string, threads)
 
-	// Use a map to track active crawlers for explicit stopping
 	activeCrawlers := make(map[*core.Crawler]struct{})
 	var crawlerMutex sync.Mutex
 
-	// Goroutine to handle cancellation and explicitly stop crawlers
 	go func() {
 		<-ctx.Done()
-		// Wait a moment for things to start winding down naturally
 		time.Sleep(500 * time.Millisecond)
 
 		crawlerMutex.Lock()
@@ -231,7 +218,6 @@ func run(cmd *cobra.Command, _ []string) {
 		go func() {
 			defer wg.Done()
 			for rawSite := range inputChan {
-				// Check if context is cancelled before processing
 				if ctx.Err() != nil {
 					return
 				}
@@ -246,14 +232,12 @@ func run(cmd *cobra.Command, _ []string) {
 				var siteWg sync.WaitGroup
 
 				crawler := core.NewCrawler(site, crawlerConfig)
-				crawler.Stats = stats // Assign the global stats object
+				crawler.Stats = stats
 
-				// Register crawler
 				crawlerMutex.Lock()
 				activeCrawlers[crawler] = struct{}{}
 				crawlerMutex.Unlock()
 
-				// Ensure crawler is unregistered when done
 				defer func() {
 					crawlerMutex.Lock()
 					delete(activeCrawlers, crawler)
@@ -273,12 +257,10 @@ func run(cmd *cobra.Command, _ []string) {
 					crawler.Start(linkfinder)
 				}()
 
-				// Brute force Sitemap path
 				if sitemap {
 					siteWg.Add(1)
 					go core.ParseSiteMap(site, crawler, crawler.C, &siteWg)
 				}
-				// Find Robots.txt
 				if robots {
 					siteWg.Add(1)
 					go core.ParseRobots(site, crawler, crawler.C, &siteWg)
@@ -318,8 +300,6 @@ func run(cmd *cobra.Command, _ []string) {
 								}
 							}
 
-							// Check context/stop signal before visiting
-							// Use the exported IsStopped() method
 							if ctx.Err() != nil || crawler.IsStopped() {
 								return
 							}
@@ -335,7 +315,6 @@ func run(cmd *cobra.Command, _ []string) {
 		}()
 	}
 
-	// Feed sites into the channel, respecting context cancellation
 	go func() {
 		defer close(inputChan)
 		for _, site := range siteList {
@@ -350,10 +329,8 @@ func run(cmd *cobra.Command, _ []string) {
 
 	wg.Wait()
 
-	// Ensure the stats/signal goroutine stops if it hasn't already
 	cancel()
 
-	// Final stats report
 	elapsed := time.Since(startTime).Round(time.Second)
 	if !quiet {
 		core.Logger.Infof("Crawl finished in %s", elapsed)

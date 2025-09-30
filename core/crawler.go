@@ -84,7 +84,6 @@ type Crawler struct {
 	hybridVisitCap int
 	hybridEnqueued int64
 
-	// Fields for stopping the crawler
 	stopChan chan struct{}
 	stopped  atomic.Bool
 }
@@ -102,12 +101,10 @@ type SpiderOutput struct {
 	Snippet    string `json:"snippet,omitempty"`
 }
 
-// IsStopped returns true if the crawler has been signaled to stop.
 func (crawler *Crawler) IsStopped() bool {
 	return crawler.stopped.Load()
 }
 
-// Stop gracefully stops the crawler
 func (crawler *Crawler) Stop() {
 	if crawler.stopped.Load() {
 		return
@@ -115,19 +112,13 @@ func (crawler *Crawler) Stop() {
 	crawler.stopped.Store(true)
 	Logger.Warnf("Stopping crawler for %s...", crawler.site)
 
-	// Stop hybrid crawling if active
 	crawler.stopHybrid()
 
-	// Signal the stop channel
 	select {
 	case <-crawler.stopChan:
-		// Already closed
 	default:
 		close(crawler.stopChan)
 	}
-
-	// Wait for ongoing activities to wind down (best effort)
-	// Colly's Wait() will return faster because OnRequest callbacks will abort new requests.
 }
 
 func (crawler *Crawler) isDuplicateURL(raw string) bool {
@@ -403,8 +394,6 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 	sRegex := regexp.MustCompile(reg)
 	c.URLFilters = append(c.URLFilters, sRegex)
 
-	// The original OnRequest handler for depth is removed here because it will be replaced later.
-
 	if err := c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
 		Parallelism: concurrent,
@@ -489,7 +478,6 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 		stopChan:            make(chan struct{}),
 	}
 
-	// Add OnRequest handlers NOW, after crawler is initialized
 	crawler.C.OnRequest(func(r *colly.Request) {
 		if crawler.stopped.Load() {
 			r.Abort()
@@ -547,13 +535,11 @@ func (crawler *Crawler) feedLinkfinder(jsFileUrl string, OutputType string, sour
 			crawler.Output.WriteToFile(outputFormat)
 		}
 
-		// If JS file is minimal format. Try to find original format
 		if strings.Contains(jsFileUrl, ".min.js") {
 			originalJS := strings.ReplaceAll(jsFileUrl, ".min.js", ".js")
 			_ = crawler.LinkFinderCollector.Visit(originalJS)
 		}
 
-		// Send Javascript to Link Finder Collector
 		_ = crawler.LinkFinderCollector.Visit(jsFileUrl)
 
 	}
@@ -614,12 +600,10 @@ func (crawler *Crawler) emitJSRequest(req JSRequest, origin string) bool {
 }
 
 func (crawler *Crawler) Start(linkfinder bool) {
-	// Setup Link Finder
 	if linkfinder {
 		crawler.setupLinkFinder()
 	}
 
-	// Handle url
 	crawler.C.OnHTML("[href]", func(e *colly.HTMLElement) {
 		if crawler.stopped.Load() {
 			return
@@ -661,7 +645,6 @@ func (crawler *Crawler) Start(linkfinder bool) {
 		}
 	})
 
-	// Handle form
 	crawler.C.OnHTML("form", func(e *colly.HTMLElement) {
 		if crawler.stopped.Load() {
 			return
@@ -704,7 +687,6 @@ func (crawler *Crawler) Start(linkfinder bool) {
 		}
 	})
 
-	// Find Upload Form
 	uploadFormSet := stringset.NewStringFilter()
 	crawler.C.OnHTML(`input[type="file"]`, func(e *colly.HTMLElement) {
 		if crawler.stopped.Load() {
@@ -737,7 +719,6 @@ func (crawler *Crawler) Start(linkfinder bool) {
 
 	})
 
-	// Handle js files
 	crawler.C.OnHTML("[src]", func(e *colly.HTMLElement) {
 		if crawler.stopped.Load() {
 			return
@@ -820,7 +801,6 @@ func (crawler *Crawler) Start(linkfinder bool) {
 				return
 			}
 
-			// Verify which link is working
 			u := NormalizeDisplayURL(response.Request.URL.String())
 			outputFormat := fmt.Sprintf("[url] - [code-%d] - %s", response.StatusCode, u)
 
@@ -853,7 +833,7 @@ func (crawler *Crawler) Start(linkfinder bool) {
 			}
 
 			if crawler.raw {
-				outputFormat := fmt.Sprintf("[Raw] - \n%s\n", respStr) //PRINTCLEAN RAW for link visited only
+				outputFormat := fmt.Sprintf("[Raw] - \n%s\n", respStr)
 				if !crawler.Quiet {
 					fmt.Println(outputFormat)
 				}
@@ -870,13 +850,7 @@ func (crawler *Crawler) Start(linkfinder bool) {
 		}
 		Logger.Debugf("Error request: %s - Status code: %v - Error: %s", response.Request.URL.String(), response.StatusCode, err)
 		crawler.recordBackoff(response.StatusCode)
-		/*
-			1xx Informational
-			2xx Success
-			3xx Redirection
-			4xx Client Error
-			5xx Server Error
-		*/
+
 		if response.StatusCode == 404 || response.StatusCode == 429 || response.StatusCode < 100 || response.StatusCode >= 500 {
 			return
 		}
@@ -973,7 +947,6 @@ func (crawler *Crawler) bootstrapSubdomains() {
 	}
 }
 
-// Find subdomains from response
 func (crawler *Crawler) findSubdomains(resp string) {
 	if !crawler.subs {
 		return
@@ -1009,8 +982,6 @@ func (crawler *Crawler) findSubdomains(resp string) {
 		}
 	}
 }
-
-// Find AWS S3 from response
 
 func (crawler *Crawler) recordBackoff(status int) {
 	sleep := time.Duration(0)
@@ -1078,7 +1049,6 @@ func (crawler *Crawler) findAWSS3(resp string) {
 	}
 }
 
-// Setup link finder
 func (crawler *Crawler) setupLinkFinder() {
 	crawler.LinkFinderCollector.OnResponse(func(response *colly.Response) {
 		if crawler.stopped.Load() {
@@ -1100,7 +1070,6 @@ func (crawler *Crawler) setupLinkFinder() {
 
 		if len(crawler.filterLength_slice) == 0 || !contains(crawler.filterLength_slice, len(respStr)) {
 
-			// Verify which link is working
 			u := NormalizeDisplayURL(response.Request.URL.String())
 			outputFormat := fmt.Sprintf("[url] - [code-%d] - %s", response.StatusCode, u)
 
@@ -1155,7 +1124,6 @@ func (crawler *Crawler) setupLinkFinder() {
 
 				for _, relPath := range paths {
 					var outputFormat string
-					// JS Regex Result
 					if crawler.JsonOutput {
 						sout := SpiderOutput{
 							Input:      crawler.Input,
@@ -1182,8 +1150,6 @@ func (crawler *Crawler) setupLinkFinder() {
 						continue
 					}
 
-					// Try to request JS path
-					// Try to generate URLs with main site
 					fileExt := GetExtType(rebuildURL)
 					if fileExt == ".js" || fileExt == ".xml" || fileExt == ".json" || fileExt == ".map" {
 						crawler.feedLinkfinder(rebuildURL, "linkfinder", "javascript")
@@ -1210,8 +1176,6 @@ func (crawler *Crawler) setupLinkFinder() {
 						}
 						_ = crawler.C.Visit(rebuildURL)
 					}
-
-					// Try to generate URLs with the site where Javascript file host in (must be in main or sub domain)
 
 					urlWithJSHostIn, ok := NormalizeURL(crawler.site, relPath)
 					if ok {
@@ -1241,7 +1205,7 @@ func (crawler *Crawler) setupLinkFinder() {
 								if crawler.Output != nil {
 									crawler.Output.WriteToFile(outputFormat)
 								}
-								_ = crawler.C.Visit(urlWithJSHostIn) //not print care for lost link
+								_ = crawler.C.Visit(urlWithJSHostIn)
 							}
 						}
 
@@ -1255,7 +1219,7 @@ func (crawler *Crawler) setupLinkFinder() {
 
 				if crawler.raw {
 
-					outputFormat := fmt.Sprintf("[Raw] - \n%s\n", respStr) //PRINTCLEAN RAW for link visited only
+					outputFormat := fmt.Sprintf("[Raw] - \n%s\n", respStr)
 					if !crawler.Quiet {
 						fmt.Println(outputFormat)
 					}
@@ -1422,7 +1386,7 @@ func (crawler *Crawler) handleHybridResult(result *PageAnalysisResult) {
 	}
 
 	if crawler.Stats != nil {
-		crawler.Stats.IncrementURLsFound() // Count the analyzed page itself
+		crawler.Stats.IncrementURLsFound()
 	}
 
 	crawler.stateGraph.MarkAnalyzed(result.StateHash)
