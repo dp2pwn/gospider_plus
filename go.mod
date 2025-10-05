@@ -6,6 +6,7 @@ toolchain go1.24.3
 
 require (
 	github.com/PuerkitoBio/goquery v1.8.1
+	github.com/go-rod/rod v0.114.1
 	github.com/gocolly/colly/v2 v2.1.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mitchellh/go-homedir v1.1.0
@@ -14,6 +15,8 @@ require (
 	github.com/projectdiscovery/katana v1.2.2
 	github.com/sirupsen/logrus v1.9.0
 	github.com/spf13/cobra v1.1.3
+	github.com/spf13/pflag v1.0.5
+	github.com/stretchr/testify v1.11.1
 	github.com/x-cray/logrus-prefixed-formatter v0.5.2
 	golang.org/x/net v0.43.0
 )
@@ -37,12 +40,12 @@ require (
 	github.com/bodgit/windows v1.0.1 // indirect
 	github.com/cloudflare/circl v1.6.1 // indirect
 	github.com/cnf/structhash v0.0.0-20201127153200-e1b16c1ebc08 // indirect
+	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/dimchansky/utfbom v1.1.1 // indirect
 	github.com/ditashi/jsbeautifier-go v0.0.0-20141206144643-2520a8026a9c // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/dsnet/compress v0.0.2-0.20230904184137-39efe44ab707 // indirect
 	github.com/gaissmai/bart v0.24.0 // indirect
-	github.com/go-rod/rod v0.114.1 // indirect
 	github.com/gobwas/glob v0.2.3 // indirect
 	github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e // indirect
 	github.com/golang/protobuf v1.5.3 // indirect
@@ -74,6 +77,7 @@ require (
 	github.com/nwaples/rardecode/v2 v2.0.0-beta.4.0.20241112120701-034e449c6e78 // indirect
 	github.com/pierrec/lz4/v4 v4.1.21 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
+	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/projectdiscovery/blackrock v0.0.1 // indirect
 	github.com/projectdiscovery/dsl v0.7.0 // indirect
 	github.com/projectdiscovery/fastdialer v0.4.10 // indirect
@@ -95,7 +99,6 @@ require (
 	github.com/smacker/go-tree-sitter v0.0.0-20230720070738-0d0a9f78d8f8 // indirect
 	github.com/sorairolake/lzip-go v0.3.5 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
-	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/stoewer/go-strcase v1.3.0 // indirect
 	github.com/syndtr/goleveldb v1.0.0 // indirect
 	github.com/temoto/robotstxt v1.1.1 // indirect
