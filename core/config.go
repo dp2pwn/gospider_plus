@@ -20,6 +20,7 @@ type CrawlerConfig struct {
 	Intensity                ExtractorIntensity
 	Quiet                    bool
 	JSONOutput               bool
+	LinkFinder               bool
 	MaxDepth                 int
 	MaxConcurrency           int
 	Delay                    time.Duration
@@ -71,6 +72,7 @@ func NewCrawlerConfig(cmd *cobra.Command) CrawlerConfig {
 	cfg := CrawlerConfig{
 		Quiet:          getBool("quiet"),
 		JSONOutput:     getBool("json"),
+		LinkFinder:     getBool("js"),
 		MaxDepth:       getInt("depth"),
 		MaxConcurrency: getInt("concurrent"),
 		Delay:          time.Duration(getInt("delay")) * time.Second,

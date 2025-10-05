@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/jaeles-project/gospider/core"
 )
 
 type JSRequest struct {
@@ -214,8 +216,8 @@ func parseJSOptions(block string) jsOptions {
 				if len(pair) < 5 {
 					continue
 				}
-				key := DecodeJSString(pair[1] + pair[2] + pair[1])
-				value := DecodeJSString(pair[3] + pair[4] + pair[3])
+				key := core.DecodeChars(pair[1] + pair[2] + pair[1])
+				value := core.DecodeChars(pair[3] + pair[4] + pair[3])
 				opts.headers[key] = value
 			}
 		}
@@ -259,7 +261,7 @@ func extractStringLiteral(block, key string) string {
 		if !ok {
 			continue
 		}
-		return DecodeJSString(literal)
+		return core.DecodeChars(literal)
 	}
 
 	return ""
@@ -304,7 +306,7 @@ func decodeStringArgument(raw string) string {
 	first := raw[0]
 	last := raw[len(raw)-1]
 	if (first == '"' || first == '\'' || first == '`') && last == first {
-		return DecodeJSString(raw)
+		return core.DecodeChars(raw)
 	}
 	return ""
 }
@@ -333,7 +335,7 @@ func parseXHRRequests(source string) []JSRequest {
 		urlFragment := source[loc[10]:loc[11]]
 		quoteChar := source[loc[8]:loc[9]]
 		literal := quoteChar + urlFragment + quoteChar
-		rawURL := DecodeJSString(literal)
+		rawURL := core.DecodeChars(literal)
 		if rawURL == "" {
 			continue
 		}
