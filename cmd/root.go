@@ -1,17 +1,9 @@
 package cmd
 
 import (
-	"bufio"
-	"context"
 	"fmt"
 	"io/ioutil"
-	"net/url"
 	"os"
-	"os/signal"
-	"strings"
-	"sync"
-	"syscall"
-	"time"
 
 	"github.com/jaeles-project/gospider/core"
 	"github.com/sirupsen/logrus"
@@ -37,7 +29,6 @@ func newRootCmd() *cobra.Command {
 	registerGlobalFlags(cmd)
 	return cmd
 }
-
 // runRoot is the main function for the crawler.
 func runRoot(cmd *cobra.Command, _ []string) error {
 	version, _ := cmd.Flags().GetBool("version")
@@ -66,74 +57,6 @@ func runRoot(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	stats := core.NewCrawlStats()
-	startTime := time.Now()
-	quiet, _ := cmd.Flags().GetBool("quiet")
-
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case sig := <-sigChan:
-				core.Logger.Warnf("Received signal %s, shutting down...", sig)
-				cancel()
-				return
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if !quiet {
-					elapsed := time.Since(startTime).Round(time.Second)
-					core.Logger.Infof("Stats [%s]: URLs: %d, Requests: %d, Errors: %d, RPS: %.2f",
-						elapsed, stats.GetURLsFound(), stats.GetRequestsMade(), stats.GetErrors(), stats.GetRPS(elapsed))
-				}
-			}
-		}
-	}()
-
-	var siteList []string
-	siteInput, _ := cmd.Flags().GetString("site")
-	if siteInput != "" {
-		siteList = append(siteList, siteInput)
-	}
-	sitesListInput, _ := cmd.Flags().GetString("sites")
-	if sitesListInput != "" {
-		sitesFile := core.ReadingLines(sitesListInput)
-		if len(sitesFile) > 0 {
-			siteList = append(siteList, sitesFile...)
-		}
-	}
-
-	stat, _ := os.Stdin.Stat()
-	if (stat.Mode() & os.ModeCharDevice) == 0 {
-		sc := bufio.NewScanner(os.Stdin)
-		for sc.Scan() {
-			target := strings.TrimSpace(sc.Text())
-			if err := sc.Err(); err == nil && target != "" {
-				siteList = append(siteList, target)
-			}
-		}
-	}
-
-	if len(siteList) == 0 {
-		core.Logger.Info("No site in list. Please check your site input again")
-		return nil
-	}
-
-	threads, _ := cmd.Flags().GetInt("threads")
-	sitemap, _ := cmd.Flags().GetBool("sitemap")
-	robots, _ := cmd.Flags().GetBool("robots")
-	otherSource, _ := cmd.Flags().GetBool("other-source")
-	includeSubs, _ := cmd.Flags().GetBool("include-subs")
-	includeOtherSourceResult, _ := cmd.Flags().GetBool("include-other-source")
-
 	base, _ := cmd.Flags().GetBool("base")
 	if base {
 		cmd.Flags().Set("js", "false")
@@ -145,131 +68,11 @@ func runRoot(cmd *cobra.Command, _ []string) error {
 	}
 
 	crawlerConfig := core.NewCrawlerConfig(cmd)
+	engine := core.NewEngine(crawlerConfig)
 
-	var wg sync.WaitGroup
-	inputChan := make(chan string, threads)
+	engine.Start()
+	engine.Shutdown()
 
-	activeCrawlers := make(map[*core.Crawler]struct{})
-	var crawlerMutex sync.Mutex
-
-	go func() {
-		<-ctx.Done()
-		time.Sleep(500 * time.Millisecond)
-
-		crawlerMutex.Lock()
-		if len(activeCrawlers) > 0 {
-			core.Logger.Warn("Forcing stop on active crawlers...")
-		}
-		for crawler := range activeCrawlers {
-			crawler.Stop()
-		}
-		crawlerMutex.Unlock()
-	}()
-
-	for i := 0; i < threads; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for rawSite := range inputChan {
-				if ctx.Err() != nil {
-					return
-				}
-
-				site, err := url.Parse(rawSite)
-				if err != nil {
-					logrus.Errorf("Failed to parse %s: %s", rawSite, err)
-					stats.IncrementErrors()
-					continue
-				}
-
-				var siteWg sync.WaitGroup
-
-				crawler := core.NewCrawler(site, crawlerConfig)
-				crawler.Stats = stats
-
-				crawlerMutex.Lock()
-				activeCrawlers[crawler] = struct{}{}
-				crawlerMutex.Unlock()
-
-				defer func() {
-					crawlerMutex.Lock()
-					delete(activeCrawlers, crawler)
-					crawlerMutex.Unlock()
-				}()
-
-				siteWg.Add(1)
-				go func() {
-					defer siteWg.Done()
-					if err := crawler.DeepCrawlWithKatana(crawlerConfig); err != nil {
-						core.Logger.Errorf("katana crawl failed for %s: %v", site, err)
-					}
-				}()
-				siteWg.Add(1)
-				go func() {
-					defer siteWg.Done()
-					crawler.Start()
-				}()
-
-				if sitemap {
-					siteWg.Add(1)
-					go core.ParseSiteMap(site, crawler, crawler.C, &siteWg)
-				}
-				if robots {
-					siteWg.Add(1)
-					go core.ParseRobots(site, crawler, crawler.C, &siteWg)
-				}
-
-				if otherSource {
-					siteWg.Add(1)
-					go func() {
-						defer siteWg.Done()
-						urls := core.OtherSources(site.Hostname(), includeSubs)
-						stats.AddURLsFound(len(urls))
-						for _, u := range urls {
-							if ctx.Err() != nil || crawler.IsStopped() {
-								return
-							}
-							if includeOtherSourceResult {
-								outputFormat := fmt.Sprintf("[other-sources] - %s", u)
-								fmt.Println(outputFormat)
-								if crawler.Output != nil {
-									crawler.Output.WriteToFile(outputFormat)
-								}
-							}
-							crawler.C.Visit(u)
-						}
-					}()
-				}
-				siteWg.Wait()
-				crawler.C.Wait()
-				crawler.LinkFinderCollector.Wait()
-				crawler.WaitHybrid()
-			}
-		}()
-	}
-
-	go func() {
-		defer close(inputChan)
-		for _, site := range siteList {
-			select {
-			case <-ctx.Done():
-				core.Logger.Warn("Stopping site input due to cancellation.")
-				return
-			case inputChan <- site:
-			}
-		}
-	}()
-
-	wg.Wait()
-	cancel()
-
-	elapsed := time.Since(startTime).Round(time.Second)
-	if !quiet {
-		core.Logger.Infof("Crawl finished in %s", elapsed)
-		core.Logger.Infof("Final Stats: URLs Found: %d, Requests Made: %d, Errors: %d, Average RPS: %.2f",
-			stats.GetURLsFound(), stats.GetRequestsMade(), stats.GetErrors(), stats.GetRPS(elapsed))
-	}
-	core.Logger.Info("Done.")
 	return nil
 }
 
@@ -331,6 +134,7 @@ func registerGlobalFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("hybrid-headless", true, "Run hybrid browser workers in headless mode")
 	cmd.Flags().StringSlice("hybrid-init-script", []string{}, "Inject JavaScript files into hybrid browsers before navigation")
 	cmd.Flags().Int("hybrid-max-visits", 150, "Limit total pages explored by hybrid browser (0 = unlimited)")
+	cmd.Flags().String("intensity", "passive", "Crawl intensity (passive, medium, aggressive, ultra)")
 
 	cmd.Flags().SortFlags = false
 }
