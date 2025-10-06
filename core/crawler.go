@@ -30,6 +30,9 @@ type Crawler struct {
 	AntiDetectClient    *antidetect.AntiDetectClient
 	Stats               *CrawlStats
 	urlProcessor        *URLProcessor
+	ctx                 context.Context
+	cfg                 CrawlerConfig
+	intensity           ExtractorIntensity
 
 	subSet       *stringset.StringFilter
 	awsSet       *stringset.StringFilter
@@ -43,10 +46,15 @@ type Crawler struct {
 	Quiet            bool
 	JsonOutput       bool
 	length           bool
-	raw              bool
-	subs             bool
-	linkfinder       bool
-	reflected        bool
+	raw                      bool
+	subs                     bool
+	linkfinder               bool
+	sitemap                  bool
+	robots                   bool
+	otherSource              bool
+	includeSubs              bool
+	includeOtherSourceResult bool
+	reflected                bool
 	reflectedPayload string
 	reflectedStore   map[string]*reflectionEntry
 	reflectedMutex   sync.Mutex
@@ -209,7 +217,7 @@ func (crawler *Crawler) maybeThrottleMutations(reflected bool) {
 	time.Sleep(time.Duration(wait) * time.Millisecond)
 }
 
-func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
+func NewCrawler(ctx context.Context, site *url.URL, cfg CrawlerConfig, stats *CrawlStats) *Crawler {
 	domain := GetDomain(site)
 	if domain == "" {
 		Logger.Error("Failed to parse domain")
@@ -221,20 +229,9 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 		registry = NewURLRegistry()
 	}
 
-	quiet := cfg.Quiet
-	jsonOutput := cfg.JSONOutput
-	maxDepth := cfg.MaxDepth
-	concurrent := cfg.MaxConcurrency
-	delay := cfg.Delay
-	randomDelay := cfg.RandomDelay
-	length := cfg.Length
-	raw := cfg.Raw
-	subs := cfg.Subs
-	reflected := cfg.Reflected
-
 	c := colly.NewCollector(
 		colly.Async(true),
-		colly.MaxDepth(maxDepth),
+		colly.MaxDepth(cfg.MaxDepth),
 		colly.IgnoreRobotsTxt(),
 	)
 
@@ -352,7 +349,6 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 	var reflectedOutput *Output
 	if cfg.ReflectedOutput != "" {
 		reflectedOutput = NewOutputPath(cfg.ReflectedOutput)
-		reflected = true
 	}
 
 	filterLengthSlice := []int{}
@@ -367,7 +363,7 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 
 	reg := ""
 	hostPattern := regexp.QuoteMeta(site.Hostname())
-	if subs {
+	if cfg.Subs {
 		reg = "(?i)" + hostPattern
 	} else {
 		reg = "(?i)(?:https?://)" + hostPattern
@@ -378,9 +374,9 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 
 	if err := c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
-		Parallelism: concurrent,
-		Delay:       delay,
-		RandomDelay: randomDelay,
+		Parallelism: cfg.MaxConcurrency,
+		Delay:       cfg.Delay,
+		RandomDelay: cfg.RandomDelay,
 	}); err != nil {
 		Logger.Errorf("Failed to set Limit Rule: %s", err)
 		os.Exit(1)
@@ -424,40 +420,49 @@ func NewCrawler(site *url.URL, cfg CrawlerConfig) *Crawler {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	crawler := &Crawler{
-		C:                   c,
-		LinkFinderCollector: linkFinderCollector,
-		AntiDetectClient:    antiDetectClient,
-		site:                site,
-		Quiet:               quiet,
-		Input:               site.String(),
-		JsonOutput:          jsonOutput,
-		length:              length,
-		raw:                 raw,
-		domain:              domain,
-		Output:              output,
-		reflectedWriter:     reflectedOutput,
-		registry:            registry,
-		subSet:              stringset.NewStringFilter(),
-		jsSet:               stringset.NewStringFilter(),
-		jsRequestSet:        stringset.NewStringFilter(),
-		formSet:             stringset.NewStringFilter(),
-		awsSet:              stringset.NewStringFilter(),
-		subs:                subs,
-		linkfinder:          cfg.LinkFinder,
-		reflected:           reflected,
-		reflectedPayload:    defaultReflectedPayload,
-		reflectedStore:      make(map[string]*reflectionEntry),
-		filterLength_slice:  filterLengthSlice,
-		domDedup:            cfg.DomDedup,
-		domDedupThresh:      cfg.DomDedupThresh,
-		domDeduper:          domDeduper,
-		domSkip:             make(map[string]bool),
-		baselineFuzzCap:     cfg.BaselineFuzzCap,
-		payloadVariants:     payloadVariants,
-		baselinePayloads:    baselinePayloads,
-		payloadRNG:          rng,
-		domAnalyzer:         NewDOMAnalyzer(),
-		stopChan:            make(chan struct{}),
+		C:                        c,
+		LinkFinderCollector:      linkFinderCollector,
+		AntiDetectClient:         antiDetectClient,
+		site:                     site,
+		ctx:                      ctx,
+		cfg:                      cfg,
+		intensity:                ExtractorIntensity(cfg.Intensity),
+		Stats:                    stats,
+		Quiet:                    cfg.Quiet,
+		Input:                    site.String(),
+		JsonOutput:               cfg.JSONOutput,
+		length:                   cfg.Length,
+		raw:                      cfg.Raw,
+		domain:                   domain,
+		Output:                   output,
+		reflectedWriter:          reflectedOutput,
+		registry:                 registry,
+		subSet:                   stringset.NewStringFilter(),
+		jsSet:                    stringset.NewStringFilter(),
+		jsRequestSet:             stringset.NewStringFilter(),
+		formSet:                  stringset.NewStringFilter(),
+		awsSet:                   stringset.NewStringFilter(),
+		subs:                     cfg.Subs,
+		linkfinder:               cfg.LinkFinder,
+		sitemap:                  cfg.Sitemap,
+		robots:                   cfg.Robots,
+		otherSource:              cfg.OtherSource,
+		includeSubs:              cfg.IncludeSubs,
+		includeOtherSourceResult: cfg.IncludeOtherSourceResult,
+		reflected:                cfg.Reflected,
+		reflectedPayload:         defaultReflectedPayload,
+		reflectedStore:           make(map[string]*reflectionEntry),
+		filterLength_slice:       filterLengthSlice,
+		domDedup:                 cfg.DomDedup,
+		domDedupThresh:           cfg.DomDedupThresh,
+		domDeduper:               domDeduper,
+		domSkip:                  make(map[string]bool),
+		baselineFuzzCap:          cfg.BaselineFuzzCap,
+		payloadVariants:          payloadVariants,
+		baselinePayloads:         baselinePayloads,
+		payloadRNG:               rng,
+		domAnalyzer:              NewDOMAnalyzer(),
+		stopChan:                 make(chan struct{}),
 	}
 
 	crawler.urlProcessor = NewURLProcessor(crawler)
@@ -581,6 +586,17 @@ func (crawler *Crawler) emitJSRequest(req JSRequest, origin string) bool {
 }
 
 func (crawler *Crawler) Start() {
+	if crawler.intensity != IntensityPassive {
+		err := crawler.DeepCrawlWithKatana(crawler.cfg)
+		if err != nil {
+			Logger.Errorf("deep crawl with katana failed: %v", err)
+			if crawler.Stats != nil {
+				crawler.Stats.IncrementErrors()
+			}
+		}
+		return
+	}
+
 	// The linkfinder parameter is now implicitly handled by the unified OnResponse handler
 	crawler.C.OnHTML("[href]", func(e *colly.HTMLElement) {
 		if crawler.stopped.Load() {
@@ -875,6 +891,28 @@ func (crawler *Crawler) Start() {
 		}
 	})
 
+	var wg sync.WaitGroup
+	if crawler.sitemap {
+		wg.Add(1)
+		go ParseSiteMap(crawler.site, crawler, crawler.C, &wg)
+	}
+
+	if crawler.robots {
+		wg.Add(1)
+		go ParseRobots(crawler.site, crawler, crawler.C, &wg)
+	}
+
+	if crawler.otherSource {
+		go func() {
+			urls := OtherSources(crawler.domain, crawler.includeSubs)
+			for _, url := range urls {
+				if urlToVisit := crawler.urlProcessor.Process(url, "other-source", "other", nil); urlToVisit != "" {
+					_ = crawler.C.Visit(urlToVisit)
+				}
+			}
+		}()
+	}
+
 	if crawler.subs {
 		crawler.bootstrapSubdomains()
 	}
@@ -885,6 +923,13 @@ func (crawler *Crawler) Start() {
 			crawler.Stats.IncrementErrors()
 		}
 	}
+
+	wg.Wait()
+
+	// Wait for all collectors to finish
+	crawler.C.Wait()
+	crawler.LinkFinderCollector.Wait()
+	crawler.WaitHybrid()
 }
 
 func (crawler *Crawler) bootstrapSubdomains() {
@@ -1171,6 +1216,11 @@ func (crawler *Crawler) enqueueHybrid(raw string) {
 		return
 	}
 
+	// Stop enqueueing if the visit limit has been reached.
+	if crawler.hybridVisitCap > 0 && atomic.LoadInt64(&crawler.hybridEnqueued) >= int64(crawler.hybridVisitCap) {
+		return
+	}
+
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return
@@ -1185,6 +1235,7 @@ func (crawler *Crawler) enqueueHybrid(raw string) {
 	case <-crawler.stopChan:
 		return
 	case crawler.hybridQueue <- raw:
+		atomic.AddInt64(&crawler.hybridEnqueued, 1)
 	default:
 		Logger.Debugf("hybrid queue saturated, dropping %s", raw)
 	}

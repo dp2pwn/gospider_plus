@@ -23,13 +23,15 @@ func (crawler *Crawler) DeepCrawlWithKatana(cfg CrawlerConfig) error {
 	}
 
 	options := types.DefaultOptions
-	intensity := cfg.Intensity
-	if intensity == "" {
+	var intensity ExtractorIntensity
+	if cfg.Intensity == "" {
 		intensity = IntensityUltra
+	} else {
+		intensity = ExtractorIntensity(cfg.Intensity)
 	}
 
 	options.URLs = goflags.StringSlice{crawler.Input}
-	options.MaxDepth = resolveKatanaDepth(cfg.MaxDepth, cfg.Intensity)
+	options.MaxDepth = resolveKatanaDepth(cfg.MaxDepth, intensity)
 	if cfg.MaxConcurrency > 0 {
 		options.Concurrency = cfg.MaxConcurrency
 		options.Parallelism = cfg.MaxConcurrency
